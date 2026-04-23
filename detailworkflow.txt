@@ -1,0 +1,870 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║              NMAP ANALYZER — DETAILED WORKFLOW & TECHNICAL GUIDE            ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+This document explains every phase of the tool in detail — what happens, why
+it happens, which file handles it, and how the pieces connect together.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 1 — ENTRY POINT & ARGUMENT PARSING
+File: nmap_analyzer.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Everything starts at nmap_analyzer.py when you run:
+
+    ./analyzer.sh scan.xml -C myproject --ai --profile external --execute \
+      --remote-host kali@192.168.1.100 --remote-key ~/.ssh/kali_key
+
+Step 1.1 — Logging Setup
+  Before anything else, the tool sets up two log handlers:
+    • File handler  → logs/run_<YYYYMMDD_HHMMSS>.log  (always DEBUG level)
+    • Console handler → terminal output (respects --log-level, default INFO)
+  Every subsequent step is logged to the file for post-run troubleshooting.
+
+Step 1.2 — CVE Database Update (if --cve-db-update)
+  If --cve-db-update is passed, update_cve_db.py is called first.
+  It downloads NVD JSON feeds from nvd.nist.gov and builds/updates
+  data/cve_database.db. After updating, execution continues normally.
+  Modes:
+    auto        → full if DB does not exist, incremental otherwise
+    full        → download all feeds from 2002 to current year
+    incremental → only fetch feeds modified since last update
+    --cve-rebuild → DROP and recreate all tables before importing
+
+Step 1.3 — Pre-flight File Checks
+  Validates that scan file(s) exist and playbook file exists.
+  If the CVE database is missing, a warning is shown but execution continues
+  (CVE matching is skipped, everything else works).
+
+Step 1.4 — AI Provider Pre-flight (if --ai)
+  Pings Ollama at http://127.0.0.1:11434/api/tags (or OLLAMA_HOST env var).
+  Checks that the configured model (default: gemma4:26b) is downloaded.
+  If Ollama is unreachable or the model is missing, AI is disabled and
+  the tool continues with playbooks and CVE matching only.
+
+Step 1.5 — AnalysisConfig Assembly
+  All CLI arguments are packed into an AnalysisConfig dataclass and passed
+  to the core pipeline. This is the single object that controls the run.
+
+  Key config fields:
+    cve_db_path        → data/cve_database.db
+    playbook_path      → data/enumeration_playbooks.json
+    ai_provider        → "ollama" or None
+    ai_model           → gemma4:26b (default)
+    profile            → "external", "internal", or None
+    execute            → True/False
+    max_exec_commands  → 30 (default)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 2 — XML PARSING
+File: pentest_assistant/parser.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Function: parse_nmap(xml_file) or parse_nmap_multi([file1, file2, ...])
+
+Step 2.1 — XML Streaming Parse
+  Uses xml.etree.ElementTree.iterparse() to stream through the XML file
+  without loading the entire file into memory. This handles very large scans.
+  Uses defusedxml if installed (protects against XML bomb attacks).
+
+Step 2.2 — Host Extraction
+  For each <host> element:
+    • Status: reads <status state="up/down"> — skips down hosts
+    • IP: reads <address addrtype="ipv4"> first, then ipv6 as fallback
+    • Hostname: reads first <hostname> element if present
+
+Step 2.3 — Service Extraction
+  For each <port> under <ports>:
+    • Skips ports where <state state="..."> is not "open"
+    • Skips tcpwrapped services (not actionable)
+    • Reads: portid (number), protocol (tcp/udp), service name, product, version
+    • Creates a Service dataclass for each open port
+
+  Service dataclass fields:
+    port      → integer port number
+    protocol  → "tcp" or "udp"
+    name      → service name (e.g. "http", "ssh", "ms-wbt-server")
+    product   → software name (e.g. "Apache httpd", "OpenSSH")
+    version   → version string (e.g. "2.4.49", "8.9p1")
+
+  Key computed properties on Service:
+    group_key    → "protocol|port|name|product|version" — used for deduplication
+    label        → human-readable "80 tcp/http Apache httpd 2.4.49"
+    search_terms → list of tokens used for CVE matching
+    prompt_context → string passed to AI prompts
+
+Step 2.4 — Multi-file Merge (parse_nmap_multi)
+  When multiple XML files are provided:
+    • Calls parse_nmap() on each file
+    • Merges hosts by IP address
+    • Deduplicates services by group_key within each host
+    • Preserves hostname and "up" status if found in any file
+  Result: a single deduplicated list of Host objects from all scans.
+
+  Host dataclass fields:
+    ip        → string IP address
+    services  → list of Service objects
+    role      → assigned by role detection (next phase)
+    status    → "up" or "unknown"
+    hostname  → first hostname found, or empty string
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 3 — HOST ROLE DETECTION
+File: pentest_assistant/role_detection.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Function: detect_role(services) — called once per host after parsing.
+
+Step 3.1 — Role Classification Rules (evaluated in priority order)
+
+  Domain Controller  → kerberos + ldap in service names, OR ports {88, 389}
+  SQL Server         → mssql in any service/product text, OR port 1433
+  Web Server         → http/https in any service name, OR ports {80,443,8080,8443}
+  File Server        → smb/microsoft-ds/netbios in text, OR port 445
+  Linux Server       → ssh in text, OR port 22
+  Workstation        → rdp/ms-wbt-server/winrm in text, OR port 3389
+  Unknown            → none of the above matched
+
+Step 3.2 — Role Weights (used for risk scoring and AI prioritization)
+  Domain Controller → 5  (highest priority)
+  SQL Server        → 4
+  Web Server        → 3
+  File Server       → 3
+  Linux Server      → 2
+  Workstation       → 1
+
+Step 3.3 — Role Grouping
+  After all hosts are classified, group_by_role() builds:
+    { "Web Server": ["192.168.1.10", "192.168.1.11"],
+      "Domain Controller": ["192.168.1.5"], ... }
+  Used for the Dashboard tab checklist and report structure.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 4 — SERVICE INVENTORY & DEDUPLICATION
+File: pentest_assistant/pipeline.py → _build_service_inventory()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 4.1 — Why Deduplication Matters
+  If 10 web servers all run "Apache httpd 2.4.49 on port 80", there is no
+  point running CVE lookup and AI generation 10 times. The service is
+  analyzed once and the result applied to all 10 IPs.
+
+Step 4.2 — Service Grouping
+  Iterates all hosts and all services. Uses Service.group_key as the
+  dictionary key. For each unique key, stores:
+    service → the Service object
+    ips     → set of IPs that have this service
+    roles   → set of host roles that have this service
+
+Step 4.3 — Primary Role Selection
+  When a service appears on hosts with different roles (e.g. port 80 on
+  both a Web Server and a Domain Controller), the highest-weighted role
+  wins. This ensures CVE and AI analysis uses the most security-relevant
+  context.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 5 — CVE LOOKUP
+File: pentest_assistant/cve.py → CVELookup.lookup()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 5.1 — Search Term Extraction
+  Service.search_terms returns up to 6 tokens built from:
+    • service name (e.g. "http")
+    • product name (e.g. "apache httpd")
+    • version string (e.g. "2.4.49")
+    • major version if a dot is present (e.g. "2.4")
+  Tokens shorter than 3 characters are excluded (avoids matching "80", "2").
+  Duplicates are removed.
+
+Step 5.2 — Database Query
+  Builds a SQL query:
+    SELECT cve_id, cvss_score, description, exploit_type, is_kev
+    FROM cves
+    WHERE LOWER(description) LIKE '%apache%'
+       OR LOWER(description) LIKE '%httpd%'
+       OR LOWER(description) LIKE '%2.4.49%'
+    LIMIT 150
+
+  The tool detects available columns via PRAGMA table_info so it works
+  on older databases that may not have exploit_type or is_kev columns.
+
+Step 5.3 — Relevance Filtering
+  Not every CVE that mentions "apache" is relevant to this specific service.
+  Minimum relevance bar:
+    • At least 2 search terms must appear in the CVE description, OR
+    • 1 term match is acceptable if that term is the product name
+      (product name is the most specific identifier)
+
+Step 5.4 — Ranking Score
+  Each candidate CVE gets a rank score:
+    term_matches                          → 1 point per matched term
+    + product_bonus   (3.0)              → if product name is in description
+    + kev_bonus       (5.0)              → if CVE is in CISA KEV catalog
+    + exploit_bonus   (2.0)              → if exploit_type is rce, auth_bypass,
+                                           privesc, or sqli
+
+  CVEs are sorted by (rank_score DESC, cvss_score DESC).
+  Only the top N are returned (default: 3 per service, set by --cve-limit).
+
+Step 5.5 — Caching
+  Results are cached by service.group_key so duplicate services never hit
+  the database twice in the same run.
+
+  CVEEntry dataclass fields:
+    cve_id       → "CVE-2021-41773"
+    cvss_score   → 9.8
+    description  → full NVD description text
+    exploit_type → "rce", "auth_bypass", "privesc", "sqli", or ""
+    is_kev       → True if in CISA Known Exploited Vulnerabilities catalog
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 6 — PLAYBOOK MATCHING
+File: pentest_assistant/playbooks.py → PlaybookMatcher.match_with_metadata()
+Data: data/enumeration_playbooks.json
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 6.1 — Playbook Structure
+  The JSON file contains 120+ named rules. Each rule has:
+    services  → list of service names that trigger this rule
+    products  → list of product name substrings (e.g. "apache", "nginx")
+    ports     → list of port numbers
+    roles     → list of host roles
+    commands  → list of enumeration command strings with TARGET placeholder
+
+  Example rule (simplified):
+    "http_apache": {
+      "services": ["http", "https"],
+      "products": ["apache", "httpd"],
+      "ports": [80, 443, 8080],
+      "commands": [
+        "nikto -h http://TARGET -nointeractive",
+        "feroxbuster -u http://TARGET -w /usr/share/seclists/...",
+        "nuclei -u http://TARGET -tags apache"
+      ]
+    }
+
+Step 6.2 — Scoring Algorithm
+  Every rule is scored against the detected service:
+    +6  service name exact match (e.g. "http" in rule.services)
+    +4  rule key is substring of service name or product
+    +5  product name matches any product in rule.products
+    +3  port number is in rule.ports
+    +2  host role is in rule.roles
+
+  Rules with score > 0 are ranked. The top 3 matching rules are merged,
+  and their commands are deduplicated.
+
+Step 6.3 — Confidence Score
+  confidence = min(1.0, best_score / 20)
+  This reflects how specifically the playbook matched (used in report display).
+
+Step 6.4 — Command Deduplication
+  Commands from multiple matching rules are merged in a single list.
+  Already-seen commands are skipped (set-based deduplication).
+
+Step 6.5 — Tool Policies Applied in Playbooks
+  feroxbuster  → sole web directory brute-force scanner
+  nikto        → -nointeractive flag (output goes to stdout, not file)
+  nuclei       → no -t template path (uses default templates, no permission error)
+  sslyze       → no --regular flag (removed in v5.x)
+  Brute force  → always in playbooks but classified as "manual" by executor
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 7 — AI COMMAND GENERATION
+File: pentest_assistant/ai.py → AICommandGenerator.generate()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Only runs when --ai is set. Skipped for opaque service names like
+"tcpwrapped", "unknown", "glrpc" (no useful commands can be generated).
+
+Step 7.1 — Service Category Detection
+  Each service is mapped to a category:
+    web   → http/https/squid, or ports 80/443/8080/8443/3000/5000 etc.
+    ssh   → ssh, port 22
+    smb   → smb/microsoft-ds/netbios, ports 139/445/135
+    sql   → mssql/mysql/postgres/oracle, ports 1433/3306/5432/1521
+    ldap  → ldap, ports 389/636
+    snmp  → snmp, ports 161/162
+    rdp   → rdp/ms-wbt-server, port 3389
+    ftp   → ftp, port 21
+    other → anything else
+
+Step 7.2 — Prompt Construction
+  Builds a focused prompt that:
+    • Restricts the model to tools relevant for this category only
+    • Provides a few-shot example of correct output format
+    • Uses "TARGET" as placeholder for the IP
+    • Asks for a raw JSON array of command strings (no markdown)
+    • Specifies the exact service context from Service.prompt_context
+
+Step 7.3 — Ollama API Call (streaming)
+  Sends the prompt to local Ollama via streaming HTTP POST.
+  The model streams tokens back — each token is appended to a buffer.
+  No per-chunk timeout (read=None) so slow models don't get cut off.
+  Connection timeout: 10 seconds (fails fast if Ollama is not running).
+
+Step 7.4 — Response Parsing & Validation
+  _extract_commands() does:
+    1. Strips <think>...</think> tags (used by some reasoning models)
+    2. Strips markdown code fences (```json ... ```)
+    3. Attempts JSON parse of the response as an array
+    4. If JSON fails, falls back to line-by-line extraction
+    5. Validates each command with _is_safe_command():
+         • Tool must be in ALLOWED_TOOLS list
+         • No shell control tokens (&&, ||, ;, |, >, <, $(, `)
+         • Arguments must match safe character pattern
+
+Step 7.5 — Category Relevance Filter
+  After extraction, each command's tool is checked against its category:
+    nikto/ffuf/gobuster/whatweb → only for "web" services
+    ssh-audit                   → only for "ssh" services
+    ldapsearch                  → only for "ldap" services
+    snmpwalk/snmp-check         → only for "snmp" services
+    smbclient/enum4linux etc.   → only for "smb" services
+  Commands for wrong categories are dropped (prevents AI hallucinations).
+
+Step 7.6 — Caching
+  Results cached by service.group_key + role so the same service
+  never triggers a second AI call in the same run.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 8 — RISK SCORING
+File: pentest_assistant/role_detection.py + pipeline.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 8.1 — Base CVSS Score
+  base_cvss = max CVE score among all matched CVEs for this service.
+  If no CVEs matched: base_cvss = 0.0
+
+Step 8.2 — Role Multiplier
+  risk_score = base_cvss + role_weight
+  Role weights: DC=5, SQL=4, Web=3, FileServer=3, Linux=2, Workstation=1
+
+  Example:
+    Apache 2.4.49 with CVE-2021-41773 (CVSS 9.8) on a Web Server:
+    risk_score = 9.8 + 3 = 12.8
+
+    Same service on a Domain Controller:
+    risk_score = 9.8 + 5 = 14.8  (ranked higher — DC compromise is worse)
+
+Step 8.3 — Sorting
+  All ServiceFinding objects are sorted by risk_score descending.
+  The highest-risk services appear first in all reports.
+
+  ServiceFinding dataclass fields:
+    service             → the Service object
+    ips                 → list of IPs where this service runs
+    cves                → list of CVEEntry objects
+    playbook_commands   → commands from playbook matching
+    ai_commands         → commands from AI generation
+    command_suggestions → combined list with source + confidence metadata
+    risk_score          → computed score
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 9 — AI ATTACK PLAN & NETWORK OVERVIEW
+File: pentest_assistant/ai.py → ScanAnalyzer
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Only runs when --ai is set AND the AI provider supports scan analysis.
+
+Step 9.1 — Network Overview (always when --ai)
+  generate_network_overview() builds a compact scan summary:
+    • Number of hosts
+    • Detected roles and host counts
+    • Top services found
+    • Total CVEs matched and highest CVSS score
+
+  Sends to Ollama with a prompt asking for a 2-3 sentence technical summary.
+  max_tokens=300. Result injected at the top of the AI Report tab.
+
+Step 9.2 — Profile Mode (--profile external or --profile internal)
+
+  EXTERNAL PROFILE:
+    Focuses on internet-facing attack surface. The prompt instructs the model
+    to analyze: WAF/CDN detection, initial access paths, exposed high-risk
+    services, realistic attack paths from the public internet, what to
+    prioritize first, what is noise or rabbit holes.
+
+    Output structure requested:
+      # External Exposure Summary
+      # Top Priorities (severity, why it matters, confidence, immediate action)
+      # Host-by-Host Analysis
+      # Likely Attack Paths (ranked: fastest / highest-probability / highest-impact)
+      # Service-to-Action Mapping
+      # Pentester Action Plan (Phase 1-4)
+      # Watch Outs (false positives, WAF effects, rate-limiting risks)
+      # Overall Recommendation
+      + JSON summary block
+
+  INTERNAL PROFILE:
+    Focuses on internal network. The prompt instructs the model to analyze:
+    high-value hosts, probable roles, credential access opportunities,
+    Active Directory paths, lateral movement chains, privilege escalation.
+
+    Output structure requested:
+      # Internal Environment Assessment
+      # Top Priorities
+      # Host-by-Host Analysis
+      # Attack Path / Visual Map (text-based graph)
+      # Service-to-Action Mapping
+      # Pentester Action Plan (Phase 1-4)
+      # Watch Outs
+      # Overall Recommendation
+      + JSON summary block
+
+  Both prompts use _format_nmap_output() to render all hosts/services as a
+  clean table before sending. The full formatted scan is embedded in the prompt.
+  max_tokens=8000. Up to 2 retry attempts if the first returns empty.
+
+Step 9.3 — Chunked Mode (no --profile)
+  When no profile is set, the scan is analyzed in two smaller phases:
+
+  Phase A — Per-service analysis (up to 10 service groups):
+    Each service gets a compact prompt asking for:
+      1. Exploitability (known RCE/auth-bypass in Metasploit/ExploitDB?)
+      2. Attack Path (step-by-step commands with TARGET-IP placeholder)
+      3. Quick Wins (default creds, anonymous access, known public exploits)
+    max_tokens=1500 per service.
+
+  Phase B — Cross-service correlation:
+    A single summary prompt lists all services and asks for:
+      1. Attack chains (how compromising one service enables others)
+      2. Recommended attack order
+      3. Enumeration gaps the playbooks may have missed
+    max_tokens=1500.
+
+  Results are combined into a single formatted document.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 10 — REPORT GENERATION (no --execute)
+File: pentest_assistant/reporting.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 10.1 — Text Report (findings.txt)
+  build_text_report() produces a plain-text summary printed to terminal
+  and saved to findings.txt. Includes:
+    • Host inventory with roles
+    • Per-service findings sorted by risk score
+    • CVE matches per service
+    • Playbook and AI commands
+    • Manual suggestions (brute force etc.)
+
+Step 10.2 — HTML Report (report.html)
+  generate_html_report() builds a fully self-contained HTML file with
+  embedded CSS and JavaScript — no external dependencies, works offline.
+
+  Four tabs:
+
+  TAB 1 — Dashboard
+    • Plotly charts: role distribution pie, risk score bar chart, heatmap
+    • Host inventory table (IP, hostname, role, port count)
+    • Pentest checklists per role group (e.g. "Domain Controller Checklist")
+    • Network overview summary (if AI enabled)
+
+  TAB 2 — Suggested Action
+    • One card per service group, sorted by risk score
+    • Each card shows:
+        Port / protocol / service / product / version
+        Affected IPs
+        Risk score badge
+        CVE matches (ID, CVSS, KEV badge, exploit type)
+        Playbook commands (copy button, green terminal theme)
+        AI-generated commands (copy button)
+
+  TAB 3 — AI Report
+    • Always shown when --ai is used
+    • Network Overview section at top (AI Summary badge)
+    • Full attack plan text rendered with markdown-like formatting
+    • If AI analysis failed: shows error notice with troubleshooting tips
+
+  TAB 4 — Live Findings
+    • Only populated after --execute runs
+    • Execution stats bar (total / succeeded / failed / timed out)
+    • Expandable result blocks per command
+    • Warning banners for tool-not-found or sudo issues
+    • Manual suggestions section
+    • Ollama synthesis verdict at the bottom
+
+Step 10.3 — Output Files
+  reports/<project>_<timestamp>/
+    findings.txt       → plain text
+    report.html        → interactive HTML (all tabs)
+    ai_report.txt      → raw AI attack plan text (if --ai)
+    live_findings.txt  → Ollama synthesis verdict (if --execute --ai)
+    enumeration/       → per-command output files (if --execute)
+
+  logs/run_<timestamp>.log → full DEBUG log (always)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 11 — EXECUTION PLAN BUILD
+File: pentest_assistant/executor.py → build_plan()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Only runs when --execute is set.
+
+Step 11.1 — Command Collection
+  For every ServiceFinding, combine:
+    playbook_commands + ai_commands
+  These are the raw command templates with TARGET placeholder.
+
+Step 11.2 — Target Substitution
+  substitute_targets(cmd, ip, port) replaces:
+    TARGET-IP  → actual IP address
+    TARGET     → actual IP address
+    TARGET-PORT → actual port number
+  A separate PlannedCommand is created for each unique (command, ip) pair.
+
+Step 11.3 — Classification
+  classify_command(cmd) returns one of three values:
+
+  "execute" — safe to auto-run:
+    • Tool is in EXECUTE_TOOLS allowlist
+    • No dangerous shell operators detected (checked outside quoted strings)
+    • No DoS patterns matched
+    • No brute force patterns matched
+
+    EXECUTE_TOOLS includes:
+      nmap, curl, wget, whatweb, nikto, nuclei, feroxbuster, wpscan,
+      sslscan, sslyze, testssl.sh, enum4linux, enum4linux-ng, smbclient,
+      smbmap, rpcclient, crackmapexec, nxc, ldapsearch, snmpwalk,
+      snmp-check, ssh-audit, showmount, rpcinfo, mysql, redis-cli,
+      dig, host, nslookup, smtp-user-enum, openssl,
+      impacket-lookupsid, impacket-rpcdump, impacket-samrdump,
+      impacket-GetNPUsers, impacket-GetUserSPNs
+
+  "manual" — brute force / exploitation, never auto-run, shown as suggestions:
+    Brute force tools:  hydra, medusa, patator, ncrack, hashcat, john
+    Exploitation tools: impacket-wmiexec, impacket-psexec, impacket-smbexec,
+                        impacket-secretsdump, sqlmap, msfconsole, msfvenom
+    Brute force patterns: wpscan --passwords, crackmapexec -p wordlist.txt,
+                          crackmapexec -u userlist.txt
+
+  "blocked" — discarded entirely:
+    • Shell operators outside quoted strings: &&, ||, >>, |, ;, >, <, $(, `
+    • DoS patterns: hping, slowloris, hulk, loic
+    • Commands that start with # (comments)
+    • Malformed commands that cannot be parsed
+
+  Note on operator detection:
+    Single and double-quoted strings are stripped before checking for operators.
+    This allows mysql -e 'show databases;' to execute correctly — the ; is
+    inside quotes and therefore not a shell operator.
+
+Step 11.4 — Scope Validation
+  After substitution, every IP address in the command is extracted
+  and checked against the set of IPs found in the original scan.
+  Commands targeting IPs outside the scan scope are skipped with a warning.
+  This prevents accidentally running commands against unintended targets.
+
+Step 11.5 — Deduplication and Cap
+  Executed commands are deduplicated (same command, same IP only runs once).
+  Manual suggestions are deduplicated separately.
+  If execute_count >= max_exec_commands (default: 30), additional execute-class
+  commands are demoted to manual suggestions instead of being dropped.
+
+  Result: ExecutionPlan with:
+    commands          → list of PlannedCommand (safe to auto-run)
+    manual_suggestions → list of command strings (for human review)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 12 — PRE-FLIGHT CHECKS
+File: pentest_assistant/executor.py → check_tools_available(), check_sudo_passwordless()
+File: nmap_analyzer.py (orchestration)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 12.1 — Tool Availability Check
+  Collects all unique tool names from PlannedCommand objects.
+  Builds a single shell one-liner that checks all tools at once:
+    command -v nikto >/dev/null 2>&1 && echo 'OK:nikto' || echo 'MISSING:nikto';
+    command -v feroxbuster >/dev/null ... etc.
+  Runs via SSH (if remote) or local subprocess.
+  Parses OK:/MISSING: markers to build {tool_name: bool} result.
+
+  If missing tools are found, a warning is printed per tool.
+  Execution still proceeds — the user decides whether to continue.
+
+Step 12.2 — Passwordless Sudo Check
+  Runs: sudo -n true 2>&1 && echo SUDO_OK || echo SUDO_NEEDS_PW
+  If some commands use sudo and sudo requires a password, a warning is shown
+  with the exact command to fix it:
+    echo 'kali ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/nmap-analyzer
+
+Step 12.3 — Confirmation Prompt
+  Prints the full execution plan to terminal:
+    • Execution mode: local or remote (shows remote host)
+    • Numbered list of all commands to auto-run
+    • Manual suggestions list
+  Prompts [y/N] unless --no-confirm is passed.
+  If user types anything other than y/yes, execution is skipped.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 13 — COMMAND EXECUTION
+File: pentest_assistant/executor.py → ExecutionEngine.run()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 13.1 — Health Check Thread
+  A background thread starts immediately at execution begin.
+  Every 20 seconds it wakes and prints:
+    [health] [03/15] feroxbuster → 192.168.1.10 (80/tcp/http): RUNNING (42s elapsed)
+  When a command finishes, the status label is updated immediately.
+  The thread is stopped cleanly after all commands complete.
+
+─────────────────────────────
+LOCAL EXECUTION (no --remote-host)
+─────────────────────────────
+
+Step 13.2L — Direct Subprocess
+  Each command runs via subprocess.run(command, shell=True) with:
+    • capture_output=True (stdout and stderr both captured)
+    • timeout=exec_timeout (default 60s)
+  On TimeoutExpired, the process is killed and timed_out=True is set.
+
+Step 13.3L — Output Processing
+  stdout and stderr are:
+    1. ANSI escape codes stripped (color codes from tools like nuclei)
+    2. stdout truncated at 50,000 chars with truncation note if exceeded
+    3. stderr truncated at 10,000 chars
+
+  Result is stored in a CommandResult dataclass:
+    command, service_label, target_ip, tool, stdout, stderr,
+    return_code, duration, timed_out, warning
+
+Step 13.4L — Warning Detection
+  _detect_warning() inspects the output:
+    • Exit code 127 or "command not found" text → tool not installed warning
+    • "sudo: a password is required" etc. → sudo password warning
+  Warning is stored in CommandResult.warning and printed to terminal.
+
+─────────────────────────────
+REMOTE EXECUTION (--remote-host kali@IP)
+─────────────────────────────
+
+Step 13.2R — SSH ControlMaster Connection
+  SSHMaster.connect() opens a persistent SSH connection:
+    ssh -M -S /tmp/nmap-analyzer-<pid>.sock -N -o ControlPersist=yes
+        -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+        -o ConnectTimeout=15 -p 22 kali@192.168.1.100
+  Waits for the socket file to appear (confirms connection is live).
+  All subsequent commands reuse this socket — no repeated handshakes.
+
+Step 13.3R — Tmux Session Creation (TmuxRunner.setup())
+  On the remote host, checks that tmux is installed.
+  Creates work directory: /tmp/nmap-analyzer-<session>/
+  Kills any existing session with the same name.
+  Creates a new detached tmux session:
+    tmux new-session -d -s nmap-<pid>
+  Prints the attach command so you can watch live:
+    ssh kali@192.168.1.100 -t 'tmux attach -t nmap-<pid>'
+
+Step 13.4R — Per-Command Tmux Window (TmuxRunner.start_job())
+  For each command:
+    1. A shell script is written to /tmp/nmap-analyzer-<session>/<NNN>.sh
+       Content:
+         #!/bin/bash
+         <command> > /tmp/nmap-analyzer-<session>/<NNN>.out 2>&1
+         echo $? > /tmp/nmap-analyzer-<session>/<NNN>.exit
+
+       The script is written using base64 encoding (echo encoded | base64 -d)
+       to handle any quoting or special characters in the command.
+
+    2. chmod +x applied to the script.
+
+    3. A new tmux window is opened:
+         tmux new-window -t nmap-<pid> -n j<NNN> /path/to/script.sh
+       The command runs inside this window. If SSH drops, the tmux window
+       and the command inside it keep running on the Kali box.
+
+Step 13.5R — Completion Polling
+  The tool polls every 5 seconds:
+    test -f /tmp/nmap-analyzer-<session>/<NNN>.exit
+  When the exit file exists, the command has completed.
+  If --exec-timeout is reached before the exit file appears:
+    • The tmux window is killed
+    • timed_out=True is set for this result
+
+Step 13.6R — Output Collection
+  After completion:
+    • Exit code: cat /tmp/.../NNN.exit  (reads the single digit written by $?)
+    • Output:    cat /tmp/.../NNN.out   (full stdout + stderr from the script)
+  Output is ANSI-stripped and truncated (same as local execution).
+
+Step 13.7R — Cleanup
+  After all commands finish, TmuxRunner.teardown() runs:
+    tmux kill-session -t nmap-<pid>
+    rm -rf /tmp/nmap-analyzer-<session>/
+  The SSH ControlMaster is then disconnected and the socket file removed.
+
+Step 13.8 — Per-Command File Save
+  Regardless of local or remote execution, each result is saved to:
+    enumeration/<NNN>_<ip>_<service>_<tool>.txt
+
+  File format:
+    Command : <full command string>
+    Target  : <IP address>
+    Service : <service label>
+    Duration: <seconds>
+    Status  : exit <code> or TIMEOUT
+
+    === OUTPUT ===
+    <full stdout content>
+
+    === STDERR ===
+    <stderr if any>
+
+  The NNN prefix (001, 002, ...) preserves execution order.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 14 — OLLAMA SYNTHESIS & FINAL VERDICT
+File: pentest_assistant/ai.py → ScanAnalyzer.synthesize_execution_results()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Runs after all execution commands complete, regardless of how many succeeded.
+Only runs when --ai is also set.
+
+Step 14.1 — Read Full Output Files
+  Scans the enumeration/ folder for all *.txt files, sorted by numeric prefix.
+  For each file:
+    • Reads the full file from disk (not truncated in-memory buffer)
+    • Extracts only the OUTPUT section (between === OUTPUT === and === STDERR ===)
+    • Stores indexed by file number (001 → result 1, 002 → result 2, etc.)
+  Falls back to CommandResult.output (in-memory) if file not found.
+  Per-command cap: 5,000 chars sent to model (prevents context overflow).
+
+Step 14.2 — Prompt Construction
+  Builds a structured prompt containing:
+    • Engagement profile (external / internal / unset)
+    • Total commands run, succeeded, failed count
+    • All command outputs with service label, target IP, tool, exit status
+    • Explicit instructions for each output section
+
+  Output sections requested:
+
+  ## Confirmed Findings
+    Every confirmed misconfiguration or weakness with:
+      what it is | target | evidence from output | severity
+
+  ## Key Intelligence
+    Useful information collected: versions, banners, open directories,
+    endpoints, user accounts, certificates, service configurations
+
+  ## Next Steps
+    Prioritized manual actions tied to specific findings:
+      [Priority] | Target | Action | Reason
+    No exploitation or brute force suggested — enumeration only
+
+  ## Final Verdict
+    Exactly one of:
+      CONTINUE  → clear unanswered leads needing more enumeration
+      ESCALATE  → findings sufficient for manual exploitation by tester
+      COMPLETE  → attack surface fully mapped, nothing more to discover
+    With 3-5 sentence explanation of why.
+
+Step 14.3 — Ollama Call
+  max_tokens=6000. Streaming mode (no timeout on generation).
+  <think> tags stripped from output (reasoning model artifact).
+
+Step 14.4 — Output Saved
+  live_findings.txt → raw text verdict
+  Live Findings tab in report.html → formatted HTML version
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DATA MODELS REFERENCE
+File: pentest_assistant/models.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Service (frozen dataclass)
+  port, protocol, name, product, version
+  → group_key, label, search_terms, prompt_context (computed properties)
+
+Host (dataclass)
+  ip, services, role, status, hostname
+
+CVEEntry (frozen dataclass)
+  cve_id, cvss_score, description, exploit_type, is_kev
+
+CommandSuggestion (frozen dataclass)
+  command, source ("playbook" or "ai"), confidence (0.0-1.0)
+
+ServiceFinding (dataclass)
+  service, ips, cves, playbook_commands, ai_commands,
+  command_suggestions, playbook_confidence, ai_confidence, risk_score
+
+PlannedCommand (dataclass)
+  command, service_label, target_ip, tool
+
+CommandResult (dataclass)
+  command, service_label, target_ip, tool,
+  stdout, stderr, return_code, duration, timed_out, warning
+  → success (property: return_code==0 and not timed_out)
+  → output (property: stdout + stderr combined)
+
+ExecutionPlan (dataclass)
+  commands           → list of PlannedCommand (safe to auto-run)
+  manual_suggestions → list of str (for human review only)
+
+AnalysisResult (dataclass)
+  hosts, role_groups, findings,
+  ai_enabled, ai_provider, ai_analysis, network_overview,
+  execution_plan, execution_results, manual_suggestions, live_findings
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AI PROVIDER REFERENCE
+File: pentest_assistant/providers.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+OllamaProvider.generate(prompt, max_tokens):
+  • Uses httpx streaming POST to /api/generate
+  • connect timeout: 10 seconds
+  • read timeout: None (no limit — model runs until done)
+  • Streams tokens via iter_lines(), accumulates into string
+  • Detects {"error": "..."} chunks and raises RuntimeError
+  • Logs warning if empty response received
+
+Timeout behavior:
+  --ai-timeout  → controls TCP connection timeout only (default: 10s)
+                  Fails fast if Ollama is not running.
+                  Has NO effect on how long generation takes.
+
+Environment variable:
+  OLLAMA_HOST → override Ollama URL (default: http://127.0.0.1:11434)
+  Set in .env file, auto-loaded by analyzer.sh
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECURITY BOUNDARIES SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+What auto-executes:
+  Fingerprinting, service probing, directory discovery, configuration checks,
+  anonymous enumeration, certificate inspection, DNS queries
+
+What never auto-executes (manual suggestions only):
+  Brute force, credential spraying, password cracking, lateral movement,
+  exploitation, code execution, data exfiltration
+
+What is blocked entirely:
+  Shell operators outside quoted strings (prevents command injection)
+  DoS/flooding tools
+  Out-of-scope IP addresses
+  Malformed or unparseable commands
+
+Where security checks happen:
+  1. classify_command() — tool allowlist + pattern matching + operator check
+  2. scope_check()      — IP validation against scan hosts
+  3. _is_safe_command() — AI-generated command validation (stricter allowlist)
+  4. Pre-flight         — tool availability checked before first command runs
