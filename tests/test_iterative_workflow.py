@@ -304,7 +304,7 @@ class IterativeWorkflowTests(unittest.TestCase):
             updated = run_iterative_analysis_loop(
                 result=result,
                 case_state=state,
-                analysis_provider=provider,
+                ranking_provider=provider,
                 review_provider=provider,
                 max_exec_commands=1,
                 batch_size=1,

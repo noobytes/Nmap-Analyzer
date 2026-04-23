@@ -51,7 +51,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ai_group.add_argument(
         "--preset",
-        choices=["qwen-coder", "qwen-coder-devstral"],
+        choices=["qwen-coder", "qwen-coder-devstral", "gemma-qwen-dual"],
         default="",
         help="Select a stage-routing model preset. No preset keeps current default behavior unchanged.",
     )
@@ -221,7 +221,7 @@ def _preflight_ai(
                         )
                     return False, warnings, errors
 
-                resolved_model = get_model_for_stage("analysis", resolved_models) or DEFAULT_MODELS["ollama"]
+                resolved_model = get_model_for_stage("network_overview", resolved_models) or DEFAULT_MODELS["ollama"]
                 warnings.append(f"Ollama model '{resolved_model}' not found locally. AI disabled.")
                 return False, warnings, errors
         except Exception as exc:
@@ -333,19 +333,24 @@ def main() -> int:
         return 1
 
     if ai_provider:
-        primary_model = get_model_for_stage("analysis", resolved_models) or DEFAULT_MODELS.get(ai_provider, "")
+        overview_model = get_model_for_stage("network_overview", resolved_models) or DEFAULT_MODELS.get(ai_provider, "")
+        profile_model = get_model_for_stage("profile_analysis", resolved_models) or overview_model
+        command_model = get_model_for_stage("command_generation", resolved_models) or overview_model
+        iterative_model = get_model_for_stage("iterative_ranking", resolved_models) or overview_model
         result_review_model = get_model_for_stage("result_review", resolved_models)
         profile_note = f", profile: {args.profile}" if args.profile else ""
         if args.preset or args.ai_model or args.review_model:
             print(
                 "AI enabled: "
-                f"{ai_provider} (analysis: {primary_model}, "
-                f"command_generation: {get_model_for_stage('command_generation', resolved_models) or primary_model}, "
-                f"result_review: {result_review_model or primary_model}{profile_note})",
+                f"{ai_provider} (network_overview: {overview_model}, "
+                f"profile_analysis: {profile_model}, "
+                f"command_generation: {command_model}, "
+                f"iterative_ranking: {iterative_model}, "
+                f"result_review: {result_review_model or iterative_model}{profile_note})",
                 file=sys.stderr,
             )
         else:
-            print(f"AI enabled: {ai_provider} (model: {primary_model}{profile_note})", file=sys.stderr)
+            print(f"AI enabled: {ai_provider} (model: {overview_model}{profile_note})", file=sys.stderr)
 
     if args.execute and not ai_provider:
         print("Warning: --execute works best with --ai for live findings synthesis.", file=sys.stderr)
@@ -478,7 +483,7 @@ def main() -> int:
                         stage_providers = create_stage_providers(
                             ai_provider,
                             resolved_models=resolved_models,
-                            stages=["analysis", "result_review"],
+                            stages=["iterative_ranking", "result_review"],
                             api_key=args.ai_key or None,
                             timeout=args.ai_timeout,
                         )
@@ -487,7 +492,7 @@ def main() -> int:
                 result = run_iterative_analysis_loop(
                     result=result,
                     case_state=result.case_state,
-                    analysis_provider=stage_providers.get("analysis"),
+                    ranking_provider=stage_providers.get("iterative_ranking"),
                     review_provider=stage_providers.get("result_review"),
                     max_exec_commands=config.max_exec_commands,
                     batch_size=config.iterative_batch_size,

@@ -20,7 +20,7 @@ Model routing is also opt-in:
 - **Risk scoring** — prioritizes findings by service criticality, CVE severity, KEV status, and host count
 - **AI-enhanced suggestions** — optional per-service command suggestions via local Ollama
 - **Iterative analyst loop** — persistent `case_state.json`, structured facts vs hypotheses, ranked approved validation actions, and post-result state patches
-- **Opt-in model presets** — explicit presets can route analysis and result-review stages to different models without changing the default behavior
+- **Opt-in model presets** — explicit presets can route network overview, profile analysis, command generation, iterative ranking, and result review stages without changing the default behavior
 - **AI Network Overview** — concise scan summary injected at the top of the report before the full attack plan
 - **AI Attack Plan / Analyst Summary** — legacy broad plan or structured iterative ranking depending on workflow
 - **Safe auto-execution** — `--execute` runs safe enumeration commands only (no brute force, no exploitation); brute force commands are kept as manual suggestions
@@ -124,6 +124,9 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 # Opt-in Qwen + Devstral routing preset
 ./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral
 
+# Opt-in Gemma + Qwen dual-model preset
+./analyzer.sh scan.xml -C myproject --ai --preset gemma-qwen-dual
+
 # Override the primary routed model
 ./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder --model qwen3-coder:14b
 
@@ -179,27 +182,32 @@ If you do nothing, the current default model behavior stays unchanged. The tool 
 # Default behavior: current single-model routing stays unchanged
 ./analyzer.sh scan.xml -C myproject --ai
 
-# Route analysis, command generation, and result review to qwen3-coder:30b
+# Route all routed stages to qwen3-coder:30b
 ./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder
 
-# Route analysis/command generation to qwen3-coder:30b and
-# result-review stages to devstral-small-2:24b
+# Route network overview, profile analysis, command generation, and iterative ranking
+# to qwen3-coder:30b, with result review on devstral-small-2:24b
 ./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral
+
+# Route overview/profile/command generation to gemma4:26b and
+# iterative ranking/result review to qwen2.5-coder:14b
+./analyzer.sh scan.xml -C myproject --ai --preset gemma-qwen-dual
 
 # Override the preset's primary model
 ./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder --model qwen3-coder:14b
 
 # Override the preset's review model
-./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral --review-model devstral-small-2:24b
+./analyzer.sh scan.xml -C myproject --ai --preset gemma-qwen-dual --review-model qwen2.5-coder:14b
 ```
 
 Preset routing:
 
-| Preset | Analysis | Command generation | Result review |
-|--------|----------|--------------------|---------------|
-| none | current default model | current default model | current default model |
-| `qwen-coder` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` |
-| `qwen-coder-devstral` | `qwen3-coder:30b` | `qwen3-coder:30b` | `devstral-small-2:24b` |
+| Preset | Network overview | Profile analysis | Command generation | Iterative ranking | Result review |
+|--------|------------------|------------------|--------------------|-------------------|---------------|
+| none | current default model | current default model | current default model | current default model | current default model |
+| `qwen-coder` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` |
+| `qwen-coder-devstral` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` | `devstral-small-2:24b` |
+| `gemma-qwen-dual` | `gemma4:26b` | `gemma4:26b` | `gemma4:26b` | `qwen2.5-coder:14b` | `qwen2.5-coder:14b` |
 
 ### Auto-execute safe enumeration commands
 
@@ -277,7 +285,7 @@ venv/bin/python3 nmap_analyzer.py scan.xml -C myproject --ai
 
 ```
 usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
-                        [--preset {qwen-coder,qwen-coder-devstral}]
+                        [--preset {qwen-coder,qwen-coder-devstral,gemma-qwen-dual}]
                         [--profile {external,internal}] [--model AI_MODEL]
                         [--review-model REVIEW_MODEL] [--ai-key AI_KEY]
                         [--ai-timeout AI_TIMEOUT]
@@ -302,7 +310,7 @@ usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--ai [PROVIDER]` | — | Enable AI via local Ollama |
-| `--preset {qwen-coder,qwen-coder-devstral}` | — | Enable opt-in stage-based model routing |
+| `--preset {qwen-coder,qwen-coder-devstral,gemma-qwen-dual}` | — | Enable opt-in stage-based model routing |
 | `--profile {external,internal}` | — | Engagement profile for attack plan (requires `--ai`) |
 | `--model <model>` | `gemma4:26b` | Override the primary AI model |
 | `--review-model <model>` | — | Override the result-review model |
@@ -400,8 +408,11 @@ Both prompts enforce the same rules:
 |----------|------|-----------------|-------|
 | Ollama | `--ai` | `gemma4:26b` | Free, local, no API key needed |
 
-Override the model with `--ai-model <name>`, e.g.:
+Override the model with `--ai-model <name>`, or use a preset to route stages automatically, e.g.:
 ```bash
+# Gemma for overview/profile/command generation, Qwen for iterative ranking/result review
+./analyzer.sh scan.xml -C test --ai --preset gemma-qwen-dual
+
 # Faster, lighter option
 ./analyzer.sh scan.xml -C test --ai --ai-model qwen2.5-coder:14b
 
