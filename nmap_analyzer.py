@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pentest_assistant.pipeline import AnalysisConfig, analyze_scan
-from pentest_assistant.providers import DEFAULT_MODELS
+from pentest_assistant.providers import (
+    DEFAULT_MODELS,
+    create_stage_providers,
+    get_missing_stage_models,
+    get_model_for_stage,
+    resolve_models,
+)
 from pentest_assistant.reporting import build_text_report, generate_html_report
 from update_cve_db import UpdateConfig as CVEUpdateConfig
 from update_cve_db import update_cve_database
@@ -44,6 +50,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable AI suggestions using local Ollama (default: ollama)",
     )
     ai_group.add_argument(
+        "--preset",
+        choices=["qwen-coder", "qwen-coder-devstral"],
+        default="",
+        help="Select a stage-routing model preset. No preset keeps current default behavior unchanged.",
+    )
+    ai_group.add_argument(
         "--profile", choices=["external", "internal"], default=None,
         help=(
             "Engagement profile for AI attack plan analysis. "
@@ -52,7 +64,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "Requires --ai."
         ),
     )
-    ai_group.add_argument("--ai-model", default="", help="Override AI model name (default: auto per provider)")
+    ai_group.add_argument(
+        "--model", "--ai-model",
+        dest="ai_model",
+        default="",
+        help="Override the primary AI model name. --ai-model is kept as a compatibility alias.",
+    )
+    ai_group.add_argument(
+        "--review-model",
+        default="",
+        help="Override the review model used for result-review stages.",
+    )
     ai_group.add_argument("--ai-key", default=None, help="API key for AI provider (or use env vars)")
     ai_group.add_argument("--ai-timeout", type=float, default=10.0, help="Ollama connection timeout in seconds (default: 10). Generation itself has no timeout — the model runs until done.")
     ai_group.add_argument("--max-ai-commands", type=int, default=8, help="Max AI commands per service (default: 8)")
@@ -86,8 +108,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Max commands to execute automatically (default: 30)",
     )
     exec_group.add_argument(
+        "--workflow", choices=["iterative", "legacy"], default=None,
+        help=(
+            "Execution workflow. Defaults to iterative when both --ai and --execute are enabled; "
+            "otherwise defaults to legacy."
+        ),
+    )
+    exec_group.add_argument(
+        "--iterative-batch-size", type=int, default=1,
+        help="Max approved validation commands per iterative loop (default: 1, max: 3)",
+    )
+    exec_group.add_argument(
         "--no-confirm", action="store_true",
         help="Skip confirmation prompt before executing commands",
+    )
+    exec_group.add_argument(
+        "--case-state", default="",
+        help="Path to save or resume iterative workflow state (default: report_dir/case_state.json)",
     )
     exec_group.add_argument(
         "--remote-host", default="", metavar="USER@HOST",
@@ -162,34 +199,40 @@ def _preflight_scan(scan_path: str, playbook_path: str, cve_db_path: str) -> tup
     return errors, warnings
 
 
-def _preflight_ai(provider_name: str, model: str, api_key: str | None) -> tuple[bool, list[str]]:
-    """Validate AI provider availability. Returns (ok, warnings)."""
+def _preflight_ai(
+    provider_name: str,
+    resolved_models: dict[str, Any],
+    strict_routing: bool,
+    api_key: str | None,
+) -> tuple[bool, list[str], list[str]]:
+    """Validate AI provider availability. Returns (ok, warnings, errors)."""
     warnings: list[str] = []
+    errors: list[str] = []
 
     if provider_name == "ollama":
         try:
-            import httpx
-            resp = httpx.get(
-                os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434") + "/api/tags",
-                timeout=5.0,
-            )
-            models_data = resp.json().get("models", [])
-            model_names = set()
-            for entry in models_data:
-                for key in ("model", "name"):
-                    val = entry.get(key) if isinstance(entry, dict) else getattr(entry, key, None)
-                    if isinstance(val, str) and val.strip():
-                        model_names.add(val.strip())
+            missing_models = get_missing_stage_models(provider_name, resolved_models)
+            if missing_models:
+                if strict_routing:
+                    for stage, model in missing_models:
+                        errors.append(
+                            f"Missing Ollama model '{model}' for stage '{stage}'. "
+                            f"Pull it with: ollama pull {model}"
+                        )
+                    return False, warnings, errors
 
-            resolved_model = model or DEFAULT_MODELS["ollama"]
-            if model_names and resolved_model not in model_names:
+                resolved_model = get_model_for_stage("analysis", resolved_models) or DEFAULT_MODELS["ollama"]
                 warnings.append(f"Ollama model '{resolved_model}' not found locally. AI disabled.")
-                return False, warnings
+                return False, warnings, errors
         except Exception as exc:
-            warnings.append(f"Ollama unavailable ({exc}). AI disabled.")
-            return False, warnings
+            message = f"Ollama unavailable ({exc})."
+            if strict_routing:
+                errors.append(message)
+                return False, warnings, errors
+            warnings.append(message + " AI disabled.")
+            return False, warnings, errors
 
-    return True, warnings
+    return True, warnings, errors
 
 
 def main() -> int:
@@ -265,9 +308,20 @@ def main() -> int:
         parser.error("--profile requires --ai (e.g. --ai --profile external)")
 
     ai_provider = args.ai  # None if not set, "ollama" if set
+    resolved_models = resolve_models(cli_args=args)
     if ai_provider:
-        ai_ok, ai_warnings = _preflight_ai(ai_provider, args.ai_model, args.ai_key)
+        strict_routing = bool(args.preset or args.ai_model or args.review_model)
+        ai_ok, ai_warnings, ai_errors = _preflight_ai(
+            ai_provider,
+            resolved_models,
+            strict_routing=strict_routing,
+            api_key=args.ai_key,
+        )
         preflight_warnings.extend(ai_warnings)
+        if ai_errors:
+            for error in ai_errors:
+                print(f"Error: {error}", file=sys.stderr)
+            return 1
         if not ai_ok:
             ai_provider = None
 
@@ -279,24 +333,56 @@ def main() -> int:
         return 1
 
     if ai_provider:
-        resolved_model = args.ai_model or DEFAULT_MODELS.get(ai_provider, "")
+        primary_model = get_model_for_stage("analysis", resolved_models) or DEFAULT_MODELS.get(ai_provider, "")
+        result_review_model = get_model_for_stage("result_review", resolved_models)
+        second_opinion_model = get_model_for_stage("second_opinion", resolved_models)
         profile_note = f", profile: {args.profile}" if args.profile else ""
-        print(f"AI enabled: {ai_provider} (model: {resolved_model}{profile_note})", file=sys.stderr)
+        if args.preset or args.ai_model or args.review_model:
+            print(
+                "AI enabled: "
+                f"{ai_provider} (analysis: {primary_model}, "
+                f"command_generation: {get_model_for_stage('command_generation', resolved_models) or primary_model}, "
+                f"result_review: {result_review_model or primary_model}, "
+                f"second_opinion: {second_opinion_model or 'disabled'}{profile_note})",
+                file=sys.stderr,
+            )
+        else:
+            print(f"AI enabled: {ai_provider} (model: {primary_model}{profile_note})", file=sys.stderr)
 
     if args.execute and not ai_provider:
         print("Warning: --execute works best with --ai for live findings synthesis.", file=sys.stderr)
+
+    resolved_workflow = args.workflow
+    if resolved_workflow is None:
+        resolved_workflow = "iterative" if (args.execute and ai_provider) else "legacy"
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.project:
+        safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", args.project).strip("_")
+        folder_name = f"{safe_name}_{timestamp}"
+    else:
+        folder_name = timestamp
+    report_dir = Path("reports") / folder_name
+    report_dir.mkdir(parents=True, exist_ok=True)
+    case_state_path = Path(args.case_state) if args.case_state else (report_dir / "case_state.json")
 
     config = AnalysisConfig(
         cve_db_path=args.db,
         playbook_path=args.playbooks,
         ai_provider=ai_provider,
         ai_model=args.ai_model,
+        review_model=args.review_model,
+        preset=args.preset,
         ai_key=args.ai_key or "",
         ai_timeout_seconds=max(1.0, args.ai_timeout),
         max_ai_commands=max(0, args.max_ai_commands),
         profile=args.profile,
         execute=args.execute,
         max_exec_commands=max(1, args.max_exec_commands),
+        workflow=resolved_workflow,
+        iterative_batch_size=max(1, min(args.iterative_batch_size, 3)),
+        case_state_path=str(case_state_path),
+        resolved_models=resolved_models,
     )
 
     try:
@@ -311,15 +397,6 @@ def main() -> int:
     text_report = build_text_report(result)
     print(text_report)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if args.project:
-        safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", args.project).strip("_")
-        folder_name = f"{safe_name}_{timestamp}"
-    else:
-        folder_name = timestamp
-    report_dir = Path("reports") / folder_name
-    report_dir.mkdir(parents=True, exist_ok=True)
-
     # --- Execution phase ---
     if args.execute and result.execution_plan:
         plan = result.execution_plan
@@ -332,7 +409,7 @@ def main() -> int:
                 check_tools_available, check_sudo_passwordless,
             )
             from pentest_assistant.ai import ScanAnalyzer
-            from pentest_assistant.providers import create_provider
+            from pentest_assistant.analysis_loop import run_iterative_analysis_loop
 
             ssh_config = None
             ssh_master_for_preflight: Any = None
@@ -346,7 +423,14 @@ def main() -> int:
 
             # --- Pre-flight: tool availability + sudo check ---
             print("\nRunning pre-flight checks...")
-            tools_needed = {cmd.tool for cmd in plan.commands}
+            if result.workflow == "iterative":
+                tools_needed = {
+                    action.approved_tool
+                    for action in result.recommended_validations
+                    if action.action_type == "safe_enumeration" and action.approved_tool
+                }
+            else:
+                tools_needed = {cmd.tool for cmd in plan.commands}
 
             try:
                 master_ctx = SSHMaster(ssh_config) if ssh_config else None
@@ -384,51 +468,92 @@ def main() -> int:
             except Exception as exc:
                 print(f"  Pre-flight check failed: {exc}")
 
-            print(f"\nExecuting {len(plan.commands)} commands...\n")
-            enum_dir = report_dir / "enumeration"
             engine = ExecutionEngine(timeout=args.exec_timeout, ssh_config=ssh_config)
-            result.execution_results = engine.run(plan.commands, enum_dir)
-            result.manual_suggestions = plan.manual_suggestions
-
-            total_cmds = len(result.execution_results)
-            successes = sum(1 for r in result.execution_results if r.success)
-            failed = total_cmds - successes
-            print(f"\nExecution complete: {successes}/{total_cmds} succeeded", end="")
-            print(f", {failed} failed/timed out." if failed else ".")
-
-            # AI synthesis — always runs after execution if AI is enabled,
-            # regardless of how many commands succeeded. Partial results are
-            # still valuable and Ollama explicitly notes what failed.
-            if ai_provider and result.execution_results:
+            if result.workflow == "iterative" and result.case_state is not None:
                 print(
-                    f"\nSynthesizing {total_cmds} enumeration results with Ollama...\n"
-                    f"  Reading full output from: {enum_dir}/\n"
-                    f"  This may take a few minutes depending on the model..."
+                    f"\nRunning iterative approved-validation workflow "
+                    f"(batch size: {config.iterative_batch_size}, max commands: {config.max_exec_commands})...\n"
                 )
-                try:
-                    synth_provider = create_provider(
-                        ai_provider,
-                        model=args.ai_model or None,
-                        timeout=args.ai_timeout,
+                stage_providers = {}
+                if ai_provider:
+                    try:
+                        stage_providers = create_stage_providers(
+                            ai_provider,
+                            resolved_models=resolved_models,
+                            stages=["analysis", "result_review", "second_opinion"],
+                            api_key=args.ai_key or None,
+                            timeout=args.ai_timeout,
+                        )
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning("Iterative AI provider setup failed: %s", exc)
+                result = run_iterative_analysis_loop(
+                    result=result,
+                    case_state=result.case_state,
+                    analysis_provider=stage_providers.get("analysis"),
+                    review_provider=stage_providers.get("result_review"),
+                    second_opinion_provider=stage_providers.get("second_opinion"),
+                    max_exec_commands=config.max_exec_commands,
+                    batch_size=config.iterative_batch_size,
+                    output_dir=report_dir,
+                    execution_runner=engine.run,
+                    case_state_path=case_state_path,
+                )
+                total_cmds = len(result.execution_results)
+                successes = sum(1 for r in result.execution_results if r.success)
+                failed = total_cmds - successes
+                print(f"Iterative execution complete: {successes}/{total_cmds} succeeded", end="")
+                print(f", {failed} failed/timed out." if failed else ".")
+            else:
+                print(f"\nExecuting {len(plan.commands)} commands...\n")
+                enum_dir = report_dir / "enumeration"
+                result.execution_results = engine.run(plan.commands, enum_dir)
+                result.manual_suggestions = plan.manual_suggestions
+
+                total_cmds = len(result.execution_results)
+                successes = sum(1 for r in result.execution_results if r.success)
+                failed = total_cmds - successes
+                print(f"\nExecution complete: {successes}/{total_cmds} succeeded", end="")
+                print(f", {failed} failed/timed out." if failed else ".")
+
+                # AI synthesis — always runs after execution if AI is enabled,
+                # regardless of how many commands succeeded. Partial results are
+                # still valuable and Ollama explicitly notes what failed.
+                if ai_provider and result.execution_results:
+                    print(
+                        f"\nSynthesizing {total_cmds} enumeration results with Ollama...\n"
+                        f"  Reading full output from: {enum_dir}/\n"
+                        f"  This may take a few minutes depending on the model..."
                     )
-                    analyzer = ScanAnalyzer(synth_provider, profile=args.profile)
-                    result.live_findings = analyzer.synthesize_execution_results(
-                        result.execution_results,
-                        enum_dir=enum_dir,
-                        profile=args.profile,
-                    )
-                    if result.live_findings:
-                        print("  Synthesis complete.")
-                    else:
-                        print("  Warning: Ollama returned an empty synthesis.")
-                except Exception as exc:
-                    logging.getLogger(__name__).warning("Synthesis failed: %s", exc)
+                    try:
+                        stage_providers = create_stage_providers(
+                            ai_provider,
+                            resolved_models=resolved_models,
+                            stages=["result_review"],
+                            api_key=args.ai_key or None,
+                            timeout=args.ai_timeout,
+                        )
+                        synth_provider = stage_providers.get("result_review")
+                        if synth_provider is None:
+                            raise RuntimeError("No routed model available for result_review stage")
+                        analyzer = ScanAnalyzer(synth_provider, profile=args.profile)
+                        result.live_findings = analyzer.synthesize_execution_results(
+                            result.execution_results,
+                            enum_dir=enum_dir,
+                            profile=args.profile,
+                        )
+                        if result.live_findings:
+                            print("  Synthesis complete.")
+                        else:
+                            print("  Warning: Ollama returned an empty synthesis.")
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning("Synthesis failed: %s", exc)
         else:
             result.manual_suggestions = plan.manual_suggestions
             if plan.commands and not should_run:
                 print("Execution skipped.")
 
     # --- Save reports ---
+    text_report = build_text_report(result)
     text_path = report_dir / "findings.txt"
     text_path.write_text(text_report + "\n", encoding="utf-8")
 
@@ -450,6 +575,9 @@ def main() -> int:
         lf_path = report_dir / "live_findings.txt"
         lf_path.write_text(result.live_findings + "\n", encoding="utf-8")
         print(f"  live_findings.txt")
+
+    if result.case_state is not None and case_state_path.exists():
+        print(f"  case_state.json")
 
     return 0
 

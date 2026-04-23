@@ -4,6 +4,7 @@ from pathlib import Path
 
 from pentest_assistant.models import AnalysisResult, CVEEntry, Host, Service, ServiceFinding
 from pentest_assistant.reporting import build_text_report, generate_html_report
+from pentest_assistant.state import CaseState, ServiceState, ValidationAction
 
 
 class ReportingTests(unittest.TestCase):
@@ -98,6 +99,39 @@ class ReportingTests(unittest.TestCase):
             html = report_path.read_text(encoding="utf-8")
 
         self.assertNotIn('id="ai-tab"', html)
+
+    def test_reports_include_case_state_summary(self) -> None:
+        result = self._make_result()
+        result.case_state = CaseState(
+            engagement_profile="internal",
+            confirmed=["Confirmed service banner"],
+            service_states={
+                "svc-1": ServiceState(
+                    service_id="svc-1",
+                    service_label="80 tcp/http Apache 2.4.58",
+                    observations=["Banner returned Apache/2.4.58"],
+                )
+            },
+        )
+        result.next_best_action = ValidationAction(
+            goal="Check headers",
+            why_now="Smallest approved next step",
+            expected_signal="Headers",
+            command_template="curl -I http://TARGET",
+        )
+
+        text = build_text_report(result)
+        self.assertIn("=== Analyst Loop State ===", text)
+        self.assertIn("Confirmed service banner", text)
+        self.assertIn("Next Best Approved Validation", text)
+
+        with tempfile.TemporaryDirectory() as td:
+            report_path = Path(td) / "report.html"
+            generate_html_report(result, report_path, "scan.xml")
+            html = report_path.read_text(encoding="utf-8")
+
+        self.assertIn("Next Best Approved Validation", html)
+        self.assertIn("Confirmed service banner", html)
 
 
 if __name__ == "__main__":

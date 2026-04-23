@@ -3,6 +3,15 @@
 Turn nmap XML into actionable pentest reports — AI attack plans, CVE matching,
 risk scoring, enumeration playbooks, and optional automated safe enumeration in one tool.
 
+Two workflows are available:
+- `legacy` keeps the original broad attack-plan and bulk execution behavior
+- `iterative` adds a persistent analyst loop with structured observations, hypotheses, ranked approved validations, and per-result state updates
+
+Model routing is also opt-in:
+- no preset selected: current default model behavior stays unchanged
+- preset selected: specific workflow stages are routed automatically
+- explicit `--model` and `--review-model` override the preset routing
+
 ## Features
 
 - **Infrastructure role detection** — groups hosts by role (Web Server, Domain Controller, File Server, SQL Server, etc.)
@@ -10,11 +19,14 @@ risk scoring, enumeration playbooks, and optional automated safe enumeration in 
 - **CVE cross-referencing** — matches service versions against a local NVD-sourced SQLite database; ranks by relevance, CISA KEV status, and exploit type (RCE, auth bypass, privesc)
 - **Risk scoring** — prioritizes findings by service criticality, CVE severity, KEV status, and host count
 - **AI-enhanced suggestions** — optional per-service command suggestions via local Ollama
+- **Iterative analyst loop** — persistent `case_state.json`, structured facts vs hypotheses, ranked approved validation actions, and post-result state patches
+- **Opt-in model presets** — explicit presets can route analysis and result-review stages to different models without changing the default behavior
 - **AI Network Overview** — concise scan summary injected at the top of the report before the full attack plan
-- **AI Attack Plan** — per-service exploitability assessment, attack paths, quick wins, and cross-service correlation analysis
+- **AI Attack Plan / Analyst Summary** — legacy broad plan or structured iterative ranking depending on workflow
 - **Safe auto-execution** — `--execute` runs safe enumeration commands only (no brute force, no exploitation); brute force commands are kept as manual suggestions
 - **SSH remote execution** — `--remote-host kali@IP` runs all commands on a remote Kali box via SSH ControlMaster while Ollama stays on your local machine
 - **Live Findings tab** — execution results displayed in the HTML report with Ollama synthesis of all outputs
+- **Case-state persistence** — iterative workflow state can be resumed from a saved JSON file
 - **Pre-flight checks** — validates tool availability and passwordless sudo before executing
 - **Self-contained HTML report** — interactive tabbed dashboard (Dashboard, Suggested Action, AI Report, Live Findings)
 - **File logging** — every run writes a full debug log to `logs/run_<timestamp>.log`
@@ -113,6 +125,36 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 ./analyzer.sh scan.xml -C myproject --ai --profile external
 ```
 
+### Model routing and presets
+
+If you do nothing, the current default model behavior stays unchanged. The tool does not auto-switch models by task type unless you explicitly select a preset or set model flags.
+
+```bash
+# Default behavior: current single-model routing stays unchanged
+./analyzer.sh scan.xml -C myproject --ai
+
+# Route analysis, command generation, and result review to qwen3-coder:30b
+./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder
+
+# Route analysis/command generation to qwen3-coder:30b and
+# result-review/second-opinion stages to devstral-small-2:24b
+./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral
+
+# Override the preset's primary model
+./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder --model qwen3-coder:14b
+
+# Override the preset's review model
+./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral --review-model devstral-small-2:24b
+```
+
+Preset routing:
+
+| Preset | Analysis | Command generation | Result review | Second opinion |
+|--------|----------|--------------------|---------------|----------------|
+| none | current default model | current default model | current default model | disabled unless explicitly configured |
+| `qwen-coder` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` | disabled |
+| `qwen-coder-devstral` | `qwen3-coder:30b` | `qwen3-coder:30b` | `devstral-small-2:24b` | `devstral-small-2:24b` |
+
 ### Auto-execute safe enumeration commands
 
 ```bash
@@ -125,6 +167,38 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 # Limit to 20 commands, 90s timeout per command
 ./analyzer.sh scan.xml -C myproject --ai --execute --max-exec-commands 20 --exec-timeout 90
 ```
+
+### Iterative analyst workflow
+
+When `--ai` and `--execute` are enabled together, the default workflow becomes `iterative`.
+In this mode the tool:
+
+1. builds a persistent case state from parsed scan data
+2. ranks approved validation actions from playbooks plus AI suggestions
+3. executes only the top approved step by default
+4. interprets the result with a second structured prompt
+5. patches `case_state.json` and repeats until it runs out of useful approved steps or hits `--max-exec-commands`
+
+```bash
+# Default iterative mode when both --ai and --execute are enabled
+./analyzer.sh scan.xml -C myproject --ai --execute
+
+# Explicit iterative mode with a tiny batch of 2 steps per loop
+./analyzer.sh scan.xml -C myproject --ai --execute --workflow iterative --iterative-batch-size 2
+
+# Resume a previous iterative run from its saved state
+./analyzer.sh scan.xml -C myproject --ai --execute \
+  --case-state reports/myproject_20260424_120000/case_state.json
+
+# Keep the original bulk execution behavior
+./analyzer.sh scan.xml -C myproject --ai --execute --workflow legacy
+```
+
+The iterative workflow preserves the current safety model:
+- only allowlisted safe enumeration commands are auto-executed
+- manual-only and blocked actions are never auto-run
+- scope validation and missing-tool checks still apply
+- brute force, exploitation, credential attacks, and destructive testing are not auto-executed
 
 ### Execute on a remote Kali box via SSH
 
@@ -157,15 +231,20 @@ venv/bin/python3 nmap_analyzer.py scan.xml -C myproject --ai
 
 ```
 usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
-                        [--profile {external,internal}] [--ai-model AI_MODEL]
-                        [--ai-key AI_KEY] [--ai-timeout AI_TIMEOUT]
+                        [--preset {qwen-coder,qwen-coder-devstral}]
+                        [--profile {external,internal}] [--model AI_MODEL]
+                        [--review-model REVIEW_MODEL] [--ai-key AI_KEY]
+                        [--ai-timeout AI_TIMEOUT]
                         [--max-ai-commands MAX_AI_COMMANDS] [--cve-db-update]
                         [--cve-rebuild]
                         [--cve-update-mode {auto,full,incremental}]
                         [--cve-force-download] [--nvd-api-key NVD_API_KEY]
                         [--min-cvss MIN_CVSS] [--execute]
                         [--exec-timeout EXEC_TIMEOUT]
-                        [--max-exec-commands MAX_EXEC_COMMANDS] [--no-confirm]
+                        [--max-exec-commands MAX_EXEC_COMMANDS]
+                        [--workflow {iterative,legacy}]
+                        [--iterative-batch-size ITERATIVE_BATCH_SIZE]
+                        [--no-confirm] [--case-state CASE_STATE]
                         [--remote-host USER@HOST] [--remote-key PATH]
                         [--remote-port REMOTE_PORT] [--playbooks PLAYBOOKS]
                         [--log-level {DEBUG,INFO,WARNING,ERROR}] [--debug]
@@ -177,10 +256,14 @@ usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--ai [PROVIDER]` | — | Enable AI via local Ollama |
+| `--preset {qwen-coder,qwen-coder-devstral}` | — | Enable opt-in stage-based model routing |
 | `--profile {external,internal}` | — | Engagement profile for attack plan (requires `--ai`) |
-| `--ai-model <model>` | `gemma4:26b` | Override AI model name |
+| `--model <model>` | `gemma4:26b` | Override the primary AI model |
+| `--review-model <model>` | — | Override the result-review model |
 | `--ai-timeout <secs>` | `10` | Ollama **connection** timeout. Generation itself has no timeout — the model runs until done. |
 | `--max-ai-commands <n>` | `8` | Max AI-generated commands per service |
+
+`--ai-model` is still accepted as a backward-compatible alias for `--model`.
 
 #### Execution options
 
@@ -189,7 +272,10 @@ usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
 | `--execute` | off | Execute safe enumeration commands (prompts for confirmation) |
 | `--exec-timeout <secs>` | `60` | Per-command timeout during execution |
 | `--max-exec-commands <n>` | `30` | Max commands to auto-execute |
+| `--workflow {iterative,legacy}` | auto | Workflow selection. Auto = iterative when `--ai` and `--execute` are both enabled, else legacy |
+| `--iterative-batch-size <n>` | `1` | Max approved commands per iterative loop (capped at 3) |
 | `--no-confirm` | off | Skip the confirmation prompt before executing |
+| `--case-state <path>` | report dir | Save or resume iterative workflow state |
 | `--remote-host USER@HOST` | — | Run commands on a remote host via SSH |
 | `--remote-key <path>` | — | SSH private key path (default: SSH agent / default key) |
 | `--remote-port <port>` | `22` | SSH port for remote host |
@@ -224,8 +310,34 @@ Reports are saved to `reports/<project>_<timestamp>/`:
 | `report.html` | Self-contained interactive HTML report |
 | `ai_report.txt` | Raw AI attack plan text (when `--ai` is used) |
 | `live_findings.txt` | Ollama synthesis of execution results (when `--execute --ai`) |
+| `case_state.json` | Iterative workflow state file (when the iterative workflow is active) |
 | `enumeration/` | Per-command output files (when `--execute` is used) |
 | `logs/run_<timestamp>.log` | Full DEBUG log for every run |
+
+The iterative report now includes:
+- confirmed findings
+- likely findings
+- ruled-out hypotheses
+- dead ends
+- next best approved validation and why it was chosen
+- per-service observations vs hypotheses
+- prior executed validations and their outcomes
+
+Example artifacts are available in [`docs/examples/`](docs/examples/).
+
+## Prompt Templates
+
+The structured iterative workflow uses:
+- `pentest_assistant/prompts/analysis_prompt.txt` for evidence-driven action ranking
+- `pentest_assistant/prompts/result_review_prompt.txt` for post-execution result interpretation
+
+Both prompts enforce the same rules:
+- facts vs hypotheses must be separated
+- CVE matches are leads, not proof
+- recommend only approved validation actions
+- prefer the smallest next step that reduces uncertainty most
+- avoid repeating failed steps unless new evidence exists
+- output strict JSON only
 
 ### HTML Report Tabs
 

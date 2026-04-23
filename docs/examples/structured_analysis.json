@@ -1,0 +1,69 @@
+{
+  "network_summary": {
+    "facts": [
+      "A web service is exposed on 10.10.10.5:80 with Apache 2.4.58 banner data."
+    ],
+    "hypotheses": [
+      "A minimal header or fingerprinting check should confirm whether the service exposes more useful metadata."
+    ],
+    "focus": "Prefer the smallest approved HTTP validation before broader web scanning."
+  },
+  "service_assessments": [
+    {
+      "service_id": "tcp|80|http|apache|2.4.58",
+      "facts": [
+        "The service is grouped as 80 tcp/http Apache 2.4.58 on host 10.10.10.5."
+      ],
+      "hypotheses": [
+        {
+          "title": "HTTP fingerprinting may reveal framework or proxy clues.",
+          "status": "open",
+          "confidence": 0.78,
+          "evidence": [
+            "Apache banner data present in scan output."
+          ],
+          "rationale": "Banner-backed services usually benefit from a small fingerprinting pass first."
+        }
+      ],
+      "cve_interpretation": [
+        "Any matched Apache CVEs are leads based on version data and are not proof of exploitability."
+      ],
+      "recommended_validations": [
+        {
+          "service_id": "tcp|80|http|apache|2.4.58",
+          "host": "10.10.10.5",
+          "command_template": "whatweb http://TARGET",
+          "goal": "Fingerprint the web service.",
+          "why_now": "This is the smallest approved step with high expected value.",
+          "expected_signal": "Headers, framework clues, and reverse-proxy hints.",
+          "confidence": 0.8
+        }
+      ],
+      "deprioritized_actions": [
+        "Large directory scans should wait until simple fingerprinting is complete."
+      ]
+    }
+  ],
+  "global_next_steps": [
+    {
+      "service_id": "tcp|80|http|apache|2.4.58",
+      "host": "10.10.10.5",
+      "command_template": "whatweb http://TARGET",
+      "goal": "Fingerprint the web service.",
+      "why_now": "It is the smallest approved step that reduces uncertainty most.",
+      "expected_signal": "Headers, framework clues, and reverse-proxy hints.",
+      "confidence": 0.8
+    }
+  ],
+  "state_update": {
+    "add_confirmed": [],
+    "add_likely": [],
+    "add_ruled_out": [],
+    "add_dead_ends": [],
+    "notes_for_next_iteration": [
+      "Avoid broader web checks until the smallest fingerprint command is reviewed."
+    ],
+    "service_observations": {},
+    "service_hypotheses": {}
+  }
+}

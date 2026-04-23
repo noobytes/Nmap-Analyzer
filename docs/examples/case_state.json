@@ -1,0 +1,116 @@
+{
+  "engagement_profile": "internal",
+  "scope_hosts": [
+    "10.10.10.5"
+  ],
+  "approved_tools": [
+    "curl",
+    "nmap",
+    "whatweb"
+  ],
+  "hosts_summary": {
+    "total_hosts": 1,
+    "role_counts": {
+      "Web Server": 1
+    },
+    "hosts": [
+      {
+        "ip": "10.10.10.5",
+        "role": "Web Server",
+        "hostname": "intranet-app",
+        "services": [
+          "80 tcp/http Apache 2.4.58"
+        ]
+      }
+    ]
+  },
+  "service_states": {
+    "tcp|80|http|apache|2.4.58": {
+      "service_id": "tcp|80|http|apache|2.4.58",
+      "service_label": "80 tcp/http Apache 2.4.58",
+      "affected_hosts": [
+        "10.10.10.5"
+      ],
+      "role_context": [
+        "Web Server"
+      ],
+      "observations": [
+        "Observed service group 80 tcp/http Apache 2.4.58 on hosts: 10.10.10.5.",
+        "Banner returned Apache/2.4.58."
+      ],
+      "hypotheses": [
+        {
+          "title": "Validate the most informative read-only check for 80 tcp/http Apache 2.4.58.",
+          "status": "open",
+          "confidence": 0.72,
+          "evidence": [
+            "Risk score 7.5"
+          ],
+          "rationale": "Start with the smallest approved validation step before broader enumeration."
+        }
+      ],
+      "cve_interpretation": [
+        "CVE matches are version-based leads from the local database and are not proof of exposure."
+      ],
+      "recommended_validations": [
+        {
+          "rank": 1,
+          "goal": "Validate 80 tcp/http Apache 2.4.58 with whatweb.",
+          "why_now": "Risk score 7.5. Choose the smallest approved validation step that can confirm or reduce uncertainty.",
+          "expected_signal": "Return concise application headers or fingerprinting clues for 80 tcp/http Apache 2.4.58.",
+          "approved_tool": "whatweb",
+          "command_template": "whatweb http://TARGET",
+          "safety": "Approved safe enumeration command under current allowlist and scope validation.",
+          "stop_condition": "Stop after one response sample if it only repeats the existing banner or exposes no new metadata.",
+          "service_id": "tcp|80|http|apache|2.4.58",
+          "host": "10.10.10.5",
+          "expected_value": 10.1,
+          "confidence": 0.8,
+          "action_type": "safe_enumeration",
+          "dependency": "",
+          "source": "playbook"
+        }
+      ],
+      "deprioritized_actions": [],
+      "previous_results": [
+        {
+          "service_id": "tcp|80|http|apache|2.4.58",
+          "host": "10.10.10.5",
+          "command": "whatweb http://10.10.10.5",
+          "approved_tool": "whatweb",
+          "result_classification": "useful",
+          "return_code": 0,
+          "timed_out": false,
+          "summary": "Banner information was captured successfully.",
+          "warning": "",
+          "confidence": 0.8
+        }
+      ]
+    }
+  },
+  "confirmed": [],
+  "likely": [
+    "Apache banner exposed on 10.10.10.5."
+  ],
+  "ruled_out": [],
+  "dead_ends": [],
+  "notes_for_next_iteration": [
+    "Avoid repeating the same fingerprint command."
+  ],
+  "history": [
+    {
+      "type": "model_decision",
+      "summary": "Prefer the smallest approved HTTP validation."
+    },
+    {
+      "type": "execution_result",
+      "service_id": "tcp|80|http|apache|2.4.58",
+      "host": "10.10.10.5",
+      "command": "whatweb http://10.10.10.5",
+      "result_classification": "useful",
+      "summary": "Banner information was captured successfully.",
+      "return_code": 0,
+      "timed_out": false
+    }
+  ]
+}
