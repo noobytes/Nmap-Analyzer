@@ -103,6 +103,52 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 
 ## Usage
 
+### Recommended command cheat sheet
+
+```bash
+# Basic scan analysis, no AI
+./analyzer.sh scan.xml -C myproject
+
+# AI-assisted analysis with current default model behavior
+./analyzer.sh scan.xml -C myproject --ai
+
+# Internal assessment profile
+./analyzer.sh scan.xml -C myproject --ai --profile internal
+
+# External assessment profile
+./analyzer.sh scan.xml -C myproject --ai --profile external
+
+# Opt-in Qwen routing preset
+./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder
+
+# Opt-in Qwen + Devstral routing preset
+./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral
+
+# Override the primary routed model
+./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder --model qwen3-coder:14b
+
+# Override the routed review model
+./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral --review-model devstral-small-2:24b
+
+# Safe iterative execution
+./analyzer.sh scan.xml -C myproject --ai --execute
+
+# Iterative execution with a batch of 2 approved steps
+./analyzer.sh scan.xml -C myproject --ai --execute --workflow iterative --iterative-batch-size 2
+
+# Resume an iterative case from a saved state file
+./analyzer.sh scan.xml -C myproject --ai --execute --case-state reports/<run>/case_state.json
+
+# Keep the original legacy execution behavior
+./analyzer.sh scan.xml -C myproject --ai --execute --workflow legacy
+
+# Run execution remotely from a Kali box over SSH
+./analyzer.sh scan.xml -C myproject --ai --execute --remote-host kali@192.168.1.100
+
+# Update the CVE database and analyze in one run
+./analyzer.sh --cve-db-update scan.xml -C myproject --ai
+```
+
 ### Basic analysis (playbooks only, no AI)
 
 ```bash
