@@ -183,7 +183,7 @@ If you do nothing, the current default model behavior stays unchanged. The tool 
 ./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder
 
 # Route analysis/command generation to qwen3-coder:30b and
-# result-review/second-opinion stages to devstral-small-2:24b
+# result-review stages to devstral-small-2:24b
 ./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral
 
 # Override the preset's primary model
@@ -195,11 +195,11 @@ If you do nothing, the current default model behavior stays unchanged. The tool 
 
 Preset routing:
 
-| Preset | Analysis | Command generation | Result review | Second opinion |
-|--------|----------|--------------------|---------------|----------------|
-| none | current default model | current default model | current default model | disabled unless explicitly configured |
-| `qwen-coder` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` | disabled |
-| `qwen-coder-devstral` | `qwen3-coder:30b` | `qwen3-coder:30b` | `devstral-small-2:24b` | `devstral-small-2:24b` |
+| Preset | Analysis | Command generation | Result review |
+|--------|----------|--------------------|---------------|
+| none | current default model | current default model | current default model |
+| `qwen-coder` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` |
+| `qwen-coder-devstral` | `qwen3-coder:30b` | `qwen3-coder:30b` | `devstral-small-2:24b` |
 
 ### Auto-execute safe enumeration commands
 

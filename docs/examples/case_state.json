@@ -50,7 +50,12 @@
         }
       ],
       "cve_interpretation": [
-        "CVE matches are version-based leads from the local database and are not proof of exposure."
+        {
+          "cve_id": "",
+          "relevance": "context",
+          "why": "Version-based matches from the local database are only candidate leads.",
+          "note": "CVE matches are not proof of exposure and need safe validation."
+        }
       ],
       "recommended_validations": [
         {

@@ -335,15 +335,13 @@ def main() -> int:
     if ai_provider:
         primary_model = get_model_for_stage("analysis", resolved_models) or DEFAULT_MODELS.get(ai_provider, "")
         result_review_model = get_model_for_stage("result_review", resolved_models)
-        second_opinion_model = get_model_for_stage("second_opinion", resolved_models)
         profile_note = f", profile: {args.profile}" if args.profile else ""
         if args.preset or args.ai_model or args.review_model:
             print(
                 "AI enabled: "
                 f"{ai_provider} (analysis: {primary_model}, "
                 f"command_generation: {get_model_for_stage('command_generation', resolved_models) or primary_model}, "
-                f"result_review: {result_review_model or primary_model}, "
-                f"second_opinion: {second_opinion_model or 'disabled'}{profile_note})",
+                f"result_review: {result_review_model or primary_model}{profile_note})",
                 file=sys.stderr,
             )
         else:
@@ -480,7 +478,7 @@ def main() -> int:
                         stage_providers = create_stage_providers(
                             ai_provider,
                             resolved_models=resolved_models,
-                            stages=["analysis", "result_review", "second_opinion"],
+                            stages=["analysis", "result_review"],
                             api_key=args.ai_key or None,
                             timeout=args.ai_timeout,
                         )
@@ -491,7 +489,6 @@ def main() -> int:
                     case_state=result.case_state,
                     analysis_provider=stage_providers.get("analysis"),
                     review_provider=stage_providers.get("result_review"),
-                    second_opinion_provider=stage_providers.get("second_opinion"),
                     max_exec_commands=config.max_exec_commands,
                     batch_size=config.iterative_batch_size,
                     output_dir=report_dir,

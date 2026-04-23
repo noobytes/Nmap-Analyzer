@@ -18,7 +18,10 @@
   "new_findings": [
     "Apache banner exposed on 10.10.10.5."
   ],
-  "noise_or_false_positive_risk": "Low; the result is directly observable banner data.",
+  "noise_or_false_positive_risk": [
+    "Banner data can lag behind actual patch state.",
+    "A reverse proxy may still mask the underlying application stack."
+  ],
   "recommended_next_step": {
     "service_id": "tcp|80|http|apache|2.4.58",
     "host": "10.10.10.5",
@@ -26,6 +29,8 @@
     "goal": "Collect HTTP response headers.",
     "why_now": "Headers may confirm server behavior with another small approved step.",
     "expected_signal": "Response headers and proxy hints.",
+    "approved_tool": "curl",
+    "stop_condition": "Stop after one response if the headers only repeat the known banner.",
     "confidence": 0.68
   },
   "state_patch": {

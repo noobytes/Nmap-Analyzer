@@ -11,7 +11,7 @@
   "service_assessments": [
     {
       "service_id": "tcp|80|http|apache|2.4.58",
-      "facts": [
+      "observations": [
         "The service is grouped as 80 tcp/http Apache 2.4.58 on host 10.10.10.5."
       ],
       "hypotheses": [
@@ -26,7 +26,12 @@
         }
       ],
       "cve_interpretation": [
-        "Any matched Apache CVEs are leads based on version data and are not proof of exploitability."
+        {
+          "cve_id": "CVE-2024-0001",
+          "relevance": "Potentially relevant to Apache 2.4.58 banner data.",
+          "why": "The local CVE database matched the observed product/version tuple.",
+          "note": "Treat this as a lead only; version matching is not proof of exposure."
+        }
       ],
       "recommended_validations": [
         {
@@ -36,6 +41,10 @@
           "goal": "Fingerprint the web service.",
           "why_now": "This is the smallest approved step with high expected value.",
           "expected_signal": "Headers, framework clues, and reverse-proxy hints.",
+          "approved_tool": "whatweb",
+          "safety": "Approved safe enumeration command under current allowlist and scope validation.",
+          "stop_condition": "Stop after one response sample if it only repeats the existing banner or exposes no new metadata.",
+          "expected_value": 9.4,
           "confidence": 0.8
         }
       ],
@@ -52,6 +61,10 @@
       "goal": "Fingerprint the web service.",
       "why_now": "It is the smallest approved step that reduces uncertainty most.",
       "expected_signal": "Headers, framework clues, and reverse-proxy hints.",
+      "approved_tool": "whatweb",
+      "safety": "Approved safe enumeration command under current allowlist and scope validation.",
+      "stop_condition": "Stop after one response sample if it only repeats the existing banner or exposes no new metadata.",
+      "expected_value": 9.4,
       "confidence": 0.8
     }
   ],

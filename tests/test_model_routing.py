@@ -18,7 +18,6 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(get_model_for_stage("analysis", resolved), DEFAULT_MODELS["ollama"])
         self.assertEqual(get_model_for_stage("command_generation", resolved), DEFAULT_MODELS["ollama"])
         self.assertEqual(get_model_for_stage("result_review", resolved), DEFAULT_MODELS["ollama"])
-        self.assertIsNone(get_model_for_stage("second_opinion", resolved))
 
     def test_qwen_coder_preset_stage_routing(self) -> None:
         config = AnalysisConfig(ai_provider="ollama", preset="qwen-coder")
@@ -30,7 +29,6 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(get_model_for_stage("analysis", resolved), "qwen3-coder:30b")
         self.assertEqual(get_model_for_stage("command_generation", resolved), "qwen3-coder:30b")
         self.assertEqual(get_model_for_stage("result_review", resolved), "qwen3-coder:30b")
-        self.assertIsNone(get_model_for_stage("second_opinion", resolved))
 
     def test_qwen_coder_devstral_preset_stage_routing(self) -> None:
         config = AnalysisConfig(ai_provider="ollama", preset="qwen-coder-devstral")
@@ -42,7 +40,6 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(get_model_for_stage("analysis", resolved), "qwen3-coder:30b")
         self.assertEqual(get_model_for_stage("command_generation", resolved), "qwen3-coder:30b")
         self.assertEqual(get_model_for_stage("result_review", resolved), "devstral-small-2:24b")
-        self.assertEqual(get_model_for_stage("second_opinion", resolved), "devstral-small-2:24b")
 
     def test_model_override_precedence(self) -> None:
         config = AnalysisConfig(
@@ -68,7 +65,6 @@ class ModelRoutingTests(unittest.TestCase):
 
         self.assertEqual(get_model_for_stage("analysis", resolved), "qwen3-coder:30b")
         self.assertEqual(get_model_for_stage("result_review", resolved), "custom-review:8b")
-        self.assertEqual(get_model_for_stage("second_opinion", resolved), "custom-review:8b")
 
     def test_result_review_falls_back_to_primary_when_review_model_absent(self) -> None:
         config = AnalysisConfig(
@@ -80,18 +76,6 @@ class ModelRoutingTests(unittest.TestCase):
 
         self.assertEqual(get_model_for_stage("analysis", resolved), "custom-primary:14b")
         self.assertEqual(get_model_for_stage("result_review", resolved), "custom-primary:14b")
-
-    def test_second_opinion_routing_behavior(self) -> None:
-        default_resolved = resolve_models(AnalysisConfig(ai_provider="ollama"))
-        self.assertIsNone(get_model_for_stage("second_opinion", default_resolved))
-
-        preset_resolved = resolve_models(AnalysisConfig(ai_provider="ollama", preset="qwen-coder"))
-        self.assertIsNone(get_model_for_stage("second_opinion", preset_resolved))
-
-        explicit_review = resolve_models(
-            AnalysisConfig(ai_provider="ollama", review_model="custom-review:8b")
-        )
-        self.assertEqual(get_model_for_stage("second_opinion", explicit_review), "custom-review:8b")
 
     @patch("nmap_analyzer.get_missing_stage_models")
     def test_missing_model_error_handling_for_stage_based_routing(self, missing_models_mock) -> None:
