@@ -29,17 +29,18 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "reports are saved to reports/<project>_<timestamp>/ by default\n\n"
             "examples:\n"
-            "  %(prog)s scan.xml -C acme                            Analyze with project name\n"
-            "  %(prog)s scan.xml                                    Analyze (playbooks only)\n"
-            "  %(prog)s scan.xml --ai -C acme                       Playbooks + AI (Ollama)\n"
-            "  %(prog)s scan.xml --ai --profile external -C acme    External pentest profile\n"
-            "  %(prog)s scan.xml --ai --profile internal -C acme    Internal pentest profile\n"
-            "  %(prog)s --cve-db-update                             Build/update CVE database\n\n"
+            "  %(prog)s scan.xml -C acme                              Analyze with project name\n"
+            "  %(prog)s scan.xml                                      Analyze (playbooks only)\n"
+            "  %(prog)s scan.xml --ai -C acme                         Playbooks + AI (Ollama)\n"
+            "  %(prog)s scan.xml --ai --profile external -C acme      External pentest profile\n"
+            "  %(prog)s scan.xml --ai --profile internal -C acme      Internal pentest profile\n"
+            "  %(prog)s fast.xml full.xml -C acme --ai                Merge multiple scan files\n"
+            "  %(prog)s --cve-db-update                               Build/update CVE database\n\n"
             "AI provider env vars:\n"
             "  ollama    OLLAMA_HOST (default: http://127.0.0.1:11434)"
         ),
     )
-    parser.add_argument("scan", nargs="?", help="Nmap XML file to analyze")
+    parser.add_argument("scan", nargs="*", help="One or more Nmap XML files to analyze (multiple files are merged by IP)")
     parser.add_argument("-C", "--project", default=None, help="Project name (used as report subfolder name)")
 
     # --- AI options ---
@@ -51,7 +52,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ai_group.add_argument(
         "--preset",
-        choices=["qwen-coder", "qwen-coder-devstral", "gemma-qwen-dual"],
+        choices=["quick", "deep"],
         default="",
         help="Select a stage-routing model preset. No preset keeps current default behavior unchanged.",
     )
@@ -119,6 +120,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Max approved validation commands per iterative loop (default: 1, max: 3)",
     )
     exec_group.add_argument(
+        "--host-batch-size", type=int, default=5,
+        help="Max concurrent hosts per SSH batch (default: 5). Limits tmux windows opened per iteration.",
+    )
+    exec_group.add_argument(
+        "--min-action-value", type=float, default=0.0,
+        help="Skip candidates scored below this expected_value (0-10, default: 0 = disabled).",
+    )
+    exec_group.add_argument(
+        "--max-noise-streak", type=int, default=6,
+        help="Stop loop early after N consecutive noise/inconclusive results "
+             "(default: 6; auto-set to 10 for --profile internal, 4 for --profile external).",
+    )
+    exec_group.add_argument(
         "--no-confirm", action="store_true",
         help="Skip confirmation prompt before executing commands",
     )
@@ -142,7 +156,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- Output options ---
     output_group = parser.add_argument_group("output options")
     output_group.add_argument("--playbooks", default="data/enumeration_playbooks.json", help="Path to playbooks JSON file (default: data/enumeration_playbooks.json)")
+    output_group.add_argument("--wordlist", default="", metavar="PATH", help="Wordlist for web content fuzzing tools (ffuf, feroxbuster, etc.). Defaults to common.txt")
     output_group.add_argument("--db", default="data/cve_database.db", help=argparse.SUPPRESS)
+    output_group.add_argument(
+        "--regenerate-report", metavar="REPORT_DIR",
+        help="Regenerate report.html from an existing report folder without re-running any scans or AI calls (e.g. --regenerate-report reports/myproject_20260428_221239)",
+    )
 
     # --- Logging / debug ---
     log_group = parser.add_argument_group("logging")
@@ -183,13 +202,14 @@ def _confirm_execution() -> bool:
         return False
 
 
-def _preflight_scan(scan_path: str, playbook_path: str, cve_db_path: str) -> tuple[list[str], list[str]]:
+def _preflight_scan(scan_paths: list[str], playbook_path: str, cve_db_path: str) -> tuple[list[str], list[str]]:
     """Check file prerequisites. Returns (errors, warnings)."""
     errors: list[str] = []
     warnings: list[str] = []
 
-    if not Path(scan_path).exists():
-        errors.append(f"Nmap XML not found: {scan_path}")
+    for scan_path in scan_paths:
+        if not Path(scan_path).exists():
+            errors.append(f"Nmap XML not found: {scan_path}")
     if not Path(playbook_path).exists():
         errors.append(f"Playbook file not found: {playbook_path}")
     if not Path(cve_db_path).exists():
@@ -235,19 +255,166 @@ def _preflight_ai(
     return True, warnings, errors
 
 
+_NOISE_STREAK_BY_PROFILE: dict[str, int] = {
+    "internal": 10,
+    "external": 4,
+}
+_NOISE_STREAK_DEFAULT = 6  # used when no profile is selected
+
+
+def _resolve_noise_streak(args: "argparse.Namespace") -> int:
+    """Return the effective max_noise_streak for this run.
+
+    Priority order:
+    1. Explicit --max-noise-streak on the CLI (user override always wins)
+    2. Profile-based default (internal=10, external=4)
+    3. Global default (6)
+    """
+    # argparse sets the value to the default when the flag is absent.
+    # We detect an explicit user override by comparing against the argparse default.
+    user_set = args.max_noise_streak != _NOISE_STREAK_DEFAULT
+    if user_set:
+        return args.max_noise_streak
+
+    profile = (args.profile or "").lower().strip()
+    return _NOISE_STREAK_BY_PROFILE.get(profile, _NOISE_STREAK_DEFAULT)
+
+
+def _regenerate_report(report_dir: Path) -> int:
+    """Rebuild report.html from an existing report folder — no scans, no AI calls."""
+    import json as _json
+    import re as _re
+
+    from pentest_assistant.models import (
+        AnalysisResult, CommandResult, CommandSuggestion, Host, Service,
+        ServiceFinding,
+    )
+    from pentest_assistant.state import CaseState
+
+    if not report_dir.is_dir():
+        print(f"Error: report directory not found: {report_dir}", file=sys.stderr)
+        return 1
+
+    cs_path = report_dir / "case_state.json"
+    if not cs_path.exists():
+        print(f"Error: case_state.json not found in {report_dir}", file=sys.stderr)
+        return 1
+
+    print(f"Regenerating report from: {report_dir}")
+
+    # ── Load case state ────────────────────────────────────────────────────
+    case_state = CaseState.from_dict(_json.loads(cs_path.read_text(encoding="utf-8")))
+
+    # ── Reconstruct Hosts ──────────────────────────────────────────────────
+    hosts: list[Any] = []
+    role_groups: dict[str, list[str]] = {}
+    for h in case_state.hosts_summary.get("hosts", []):
+        ip, role = h.get("ip", ""), h.get("role", "Unknown")
+        svcs = [Service(port=0, protocol="tcp", name=s) for s in h.get("services", [])]
+        hosts.append(Host(ip=ip, role=role, hostname=h.get("hostname", ""), services=svcs))
+        role_groups.setdefault(role, []).append(ip)
+
+    # ── Reconstruct ServiceFindings ────────────────────────────────────────
+    findings: list[Any] = []
+    for sid, ss in case_state.service_states.items():
+        parts = sid.split("|")
+        proto   = parts[0] if len(parts) > 0 else "tcp"
+        port_s  = parts[1] if len(parts) > 1 else "0"
+        name    = parts[2] if len(parts) > 2 else sid
+        port    = int(port_s) if port_s.isdigit() else 0
+        svc = Service(port=port, protocol=proto, name=name)
+        findings.append(ServiceFinding(
+            service=svc, ips=list(ss.affected_hosts),
+            cves=[], playbook_commands=[], ai_commands=[],
+            playbook_confidence=0.0, ai_confidence=0.0,
+            command_suggestions=[
+                CommandSuggestion(
+                    command=v.command_template,
+                    source=v.source or "state",
+                    confidence=v.confidence,
+                )
+                for v in ss.recommended_validations if v.command_template
+            ],
+            risk_score=0.0,
+        ))
+
+    # ── Load execution results from enumeration files ──────────────────────
+    _CMD  = _re.compile(r"^Command\s*:\s*(.+)$", _re.MULTILINE)
+    _IP   = _re.compile(r"^Target\s*:\s*(.+)$",  _re.MULTILINE)
+    _SVC  = _re.compile(r"^Service\s*:\s*(.+)$", _re.MULTILINE)
+    _DUR  = _re.compile(r"^Duration\s*:\s*([\d.]+)", _re.MULTILINE)
+    _STAT = _re.compile(r"^Status\s*:\s*(.+)$",  _re.MULTILINE)
+    _OUT  = _re.compile(r"=== OUTPUT ===\s*\n(.*?)(?:=== STDERR ===|\Z)", _re.DOTALL)
+    _ERR  = _re.compile(r"=== STDERR ===\s*\n(.*?)$", _re.DOTALL)
+
+    def _g(m: Any, n: int = 1) -> str:
+        return m.group(n).strip() if m else ""
+
+    execution_results: list[Any] = []
+    enum_dir = report_dir / "enumeration"
+    if enum_dir.is_dir():
+        for f in sorted(enum_dir.glob("**/*.txt"), key=lambda x: x.name):
+            try:
+                raw = f.read_text(encoding="utf-8", errors="replace")
+                cmd = _g(_CMD.search(raw))
+                if not cmd:
+                    continue
+                stat = _g(_STAT.search(raw))
+                timed_out = "timed out" in stat.lower()
+                rc_m = _re.search(r"exit\s+(-?\d+)", stat)
+                rc = int(rc_m.group(1)) if rc_m else (1 if timed_out else 0)
+                execution_results.append(CommandResult(
+                    command=cmd,
+                    service_label=_g(_SVC.search(raw)),
+                    target_ip=_g(_IP.search(raw)),
+                    tool=cmd.split()[0] if cmd else "",
+                    stdout=_g(_OUT.search(raw)),
+                    stderr=_g(_ERR.search(raw)),
+                    return_code=rc,
+                    duration=float(_g(_DUR.search(raw)) or "0"),
+                    timed_out=timed_out,
+                ))
+            except Exception as exc:
+                logging.getLogger(__name__).debug("Skip %s: %s", f.name, exc)
+
+    print(f"  Loaded {len(execution_results)} execution results from enumeration/")
+
+    def _read(p: Path) -> str:
+        return p.read_text(encoding="utf-8").strip() if p.exists() else ""
+
+    result = AnalysisResult(
+        hosts=hosts,
+        role_groups=role_groups,
+        findings=findings,
+        ai_enabled=True,
+        workflow="iterative",
+        execution_results=execution_results,
+        live_findings=_read(report_dir / "live_findings.txt"),
+        ai_analysis=_read(report_dir / "ai_report.txt"),
+        case_state=case_state,
+        manual_suggestions=[],
+    )
+
+    out_path = report_dir / "report.html"
+    generate_html_report(result, out_path, scan_path="")
+    print(f"  report.html regenerated → {out_path}")
+    print(f"  {len(hosts)} hosts | {len(findings)} service groups | {len(execution_results)} commands")
+    return 0
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
-    if not args.scan and not args.cve_db_update:
-        parser.error("scan is required unless --cve-db-update is used")
+    if not args.scan and not args.cve_db_update and not args.regenerate_report:
+        parser.error("scan is required unless --cve-db-update or --regenerate-report is used")
 
     log_level = "DEBUG" if args.debug else args.log_level
 
     # Always write a full DEBUG log to logs/run_<timestamp>.log
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"run_{log_timestamp}.log"
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"run_{run_timestamp}.log"
 
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
@@ -297,9 +464,13 @@ def main() -> int:
         if not args.scan:
             return 0
 
+    # --regenerate-report: rebuild report.html from an existing report folder
+    if args.regenerate_report:
+        return _regenerate_report(Path(args.regenerate_report))
+
     # Preflight checks
     preflight_errors, preflight_warnings = _preflight_scan(
-        scan_path=args.scan,
+        scan_paths=args.scan,
         playbook_path=args.playbooks,
         cve_db_path=args.db,
     )
@@ -359,7 +530,7 @@ def main() -> int:
     if resolved_workflow is None:
         resolved_workflow = "iterative" if (args.execute and ai_provider) else "legacy"
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = run_timestamp
     if args.project:
         safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", args.project).strip("_")
         folder_name = f"{safe_name}_{timestamp}"
@@ -384,12 +555,16 @@ def main() -> int:
         max_exec_commands=max(1, args.max_exec_commands),
         workflow=resolved_workflow,
         iterative_batch_size=max(1, min(args.iterative_batch_size, 3)),
+        host_batch_size=max(1, args.host_batch_size),
+        min_action_value=max(0.0, args.min_action_value),
+        max_noise_streak=max(0, _resolve_noise_streak(args)),
         case_state_path=str(case_state_path),
         resolved_models=resolved_models,
+        wordlist=args.wordlist,
     )
 
     try:
-        result = analyze_scan(args.scan, config)
+        result = analyze_scan(args.scan if len(args.scan) > 1 else args.scan[0], config)
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -499,12 +674,52 @@ def main() -> int:
                     output_dir=report_dir,
                     execution_runner=engine.run,
                     case_state_path=case_state_path,
+                    host_batch_size=config.host_batch_size,
+                    min_action_value=config.min_action_value,
+                    max_noise_streak=config.max_noise_streak,
                 )
                 total_cmds = len(result.execution_results)
                 successes = sum(1 for r in result.execution_results if r.success)
-                failed = total_cmds - successes
+                ssl_errors = sum(1 for r in result.execution_results if r.return_code == 60)
+                failed = total_cmds - successes - ssl_errors
                 print(f"Iterative execution complete: {successes}/{total_cmds} succeeded", end="")
+                if ssl_errors:
+                    print(f", {ssl_errors} SSL cert error (exit 60 — commands now use -k)", end="")
                 print(f", {failed} failed/timed out." if failed else ".")
+
+                # Final AI synthesis — runs once after all iterations are done.
+                # Produces Confirmed Findings / Key Intelligence / Next Steps / Final Verdict.
+                if ai_provider and result.execution_results:
+                    print(
+                        f"\nRunning final AI synthesis across {total_cmds} execution results...\n"
+                        f"  This may take a few minutes depending on the model..."
+                    )
+                    try:
+                        synth_stage_providers = create_stage_providers(
+                            ai_provider,
+                            resolved_models=resolved_models,
+                            stages=["result_review"],
+                            api_key=args.ai_key or None,
+                            timeout=args.ai_timeout,
+                        )
+                        synth_provider = synth_stage_providers.get("result_review")
+                        if synth_provider is None:
+                            raise RuntimeError("No routed model available for synthesis")
+                        analyzer = ScanAnalyzer(synth_provider, profile=args.profile)
+                        iterative_enum_dir = report_dir / "enumeration"
+                        synthesis = analyzer.synthesize_execution_results(
+                            result.execution_results,
+                            enum_dir=iterative_enum_dir,
+                            profile=args.profile,
+                        )
+                        if synthesis:
+                            # Prepend the case-state summary so the HTML shows both
+                            result.live_findings = synthesis + "\n\n---\n\n" + (result.live_findings or "")
+                            print("  Final synthesis complete.")
+                        else:
+                            print("  Warning: AI synthesis returned empty — case state summary shown instead.")
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning("Final synthesis failed: %s", exc)
             else:
                 print(f"\nExecuting {len(plan.commands)} commands...\n")
                 enum_dir = report_dir / "enumeration"
@@ -555,11 +770,12 @@ def main() -> int:
                 print("Execution skipped.")
 
     # --- Save reports ---
+    report_dir.mkdir(parents=True, exist_ok=True)
     text_report = build_text_report(result)
     text_path = report_dir / "findings.txt"
     text_path.write_text(text_report + "\n", encoding="utf-8")
 
-    generate_html_report(result, report_dir / "report.html", args.scan)
+    generate_html_report(result, report_dir / "report.html", args.scan[0] if args.scan else "")
 
     print(f"\nReports saved to: {report_dir}/")
     print(f"  findings.txt")

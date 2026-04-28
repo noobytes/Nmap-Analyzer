@@ -190,30 +190,26 @@
     "context": "both",
     "category": "web",
     "tools": [
-      "nikto",
       "nuclei",
       "ffuf",
-      "gobuster",
-      "feroxbuster",
       "whatweb",
-      "wappalyzer",
       "curl",
       "nmap"
     ],
     "commands": [
-      "nmap --script http-methods,http-title,http-auth,http-headers,http-server-header -p80,8080,8000 TARGET",
-      "whatweb -a 3 http://TARGET",
-      "nikto -h http://TARGET -nointeractive",
-      "nuclei -u http://TARGET -o nuclei_TARGET.txt",
-      "feroxbuster -u http://TARGET -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt -x php,html,txt,bak,zip",
-      "curl -s -I http://TARGET",
-      "curl -s -X OPTIONS http://TARGET -D -"
+      "curl -sk -I http://TARGET:TARGET-PORT",
+      "curl -sk -X OPTIONS http://TARGET:TARGET-PORT -v",
+      "curl -sk http://TARGET:TARGET-PORT/robots.txt",
+      "curl -sk http://TARGET:TARGET-PORT/.well-known/security.txt",
+      "nmap --script http-methods,http-title,http-auth,http-headers,http-server-header,http-security-headers -p TARGET-PORT TARGET",
+      "whatweb -a 3 http://TARGET:TARGET-PORT",
+      "nuclei -u http://TARGET:TARGET-PORT -tags exposure,misconfig,default-login,cve",
+      "ffuf -u http://TARGET:TARGET-PORT/FUZZ -w /usr/share/seclists/Discovery/Web-Content/common.txt -ac -mc all -fc 404,403 -t 40"
     ],
-    "notes": "Check HTTP methods, headers (security headers missing), virtual hosts, and default credentials.",
+    "notes": "Phase 1: fingerprint (curl/whatweb/nmap). Phase 2: known CVEs and misconfigs (nuclei, all tags in one pass). Phase 3: content discovery (ffuf). Follow data flow — every parameter is a finding candidate.",
     "services": [
       "http-alt",
       "http-proxy",
-      "https",
       "squid-http"
     ]
   },
@@ -230,20 +226,28 @@
     "tools": [
       "sslscan",
       "testssl.sh",
-      "nuclei",
-      "nikto",
       "sslyze",
+      "nuclei",
+      "ffuf",
+      "whatweb",
+      "curl",
       "nmap"
     ],
     "commands": [
-      "sslscan TARGET:443",
-      "testssl.sh TARGET",
-      "sslyze TARGET",
-      "nmap --script ssl-enum-ciphers,ssl-cert,ssl-heartbleed,ssl-poodle,ssl-dh-params -p443 TARGET",
-      "nikto -h https://TARGET -nointeractive",
-      "nuclei -u https://TARGET -o nuclei_https_TARGET.txt"
+      "sslscan --no-failed --show-certificate TARGET:TARGET-PORT",
+      "testssl.sh --fast TARGET:TARGET-PORT",
+      "sslyze --regular TARGET:TARGET-PORT",
+      "nmap --script ssl-enum-ciphers,ssl-cert,ssl-heartbleed,ssl-poodle,ssl-dh-params -p TARGET-PORT TARGET",
+      "curl -sk -I https://TARGET:TARGET-PORT",
+      "curl -sk -X OPTIONS https://TARGET:TARGET-PORT -v",
+      "curl -sk https://TARGET:TARGET-PORT/robots.txt",
+      "curl -sk https://TARGET:TARGET-PORT/.well-known/security.txt",
+      "nmap --script http-methods,http-title,http-auth,http-headers,http-server-header,http-security-headers -p TARGET-PORT TARGET",
+      "whatweb -a 3 https://TARGET:TARGET-PORT",
+      "nuclei -u https://TARGET:TARGET-PORT -tags exposure,misconfig,default-login,cve",
+      "ffuf -u https://TARGET:TARGET-PORT/FUZZ -w /usr/share/seclists/Discovery/Web-Content/common.txt -ac -mc all -fc 404,403 -t 40"
     ],
-    "notes": "Check for weak ciphers, expired/self-signed certs, Heartbleed, POODLE, BEAST, and HSTS missing."
+    "notes": "Phase 1: TLS (sslscan/testssl.sh/sslyze/nmap-ssl). Phase 2: fingerprint app layer (curl/whatweb/nmap-http). Phase 3: known CVEs and misconfigs (nuclei, all tags in one pass). Phase 4: content discovery (ffuf)."
   },
   "netbios_ns": {
     "ports": [
@@ -535,7 +539,7 @@
       "snmpwalk -v2c -c public TARGET 1.3.6.1.2.1.25.4.2.1.2",
       "snmp-check TARGET -c public",
       "braa public@TARGET:.1.3.6.*",
-      "nmap --script \"snmp* and not snmp-brute\" TARGET"
+      "nmap -sU -p161 --script \"snmp* and not snmp-brute\" TARGET"
     ],
     "notes": "Community strings 'public' and 'private' are common defaults. SNMPv3 has auth. Check for system info, routing tables, and user lists."
   },
@@ -2165,7 +2169,7 @@
     "commands": [
       "nmap -sV -sC -p9090 TARGET",
       "curl -v http://TARGET:9090/",
-      "nikto -h http://TARGET:9090 -nointeractive"
+      "nuclei -u http://TARGET:9090"
     ]
   },
   "winbox": {
@@ -2203,7 +2207,7 @@
       "curl -s http://TARGET/server-info",
       "curl -s http://TARGET/.htaccess",
       "curl -s http://TARGET/.htpasswd",
-      "nmap --script http-apache-negotiation,http-server-header -p PORT TARGET",
+      "nmap --script http-apache-negotiation,http-server-header -p TARGET-PORT TARGET",
       "curl -s -H 'Range: bytes=0-18446744073709551615' http://TARGET/",
       "feroxbuster -u http://TARGET -w /usr/share/seclists/Discovery/Web-Content/common.txt -x php,html,txt,bak,old",
       "nuclei -u http://TARGET -tags apache"
@@ -2219,7 +2223,7 @@
       "curl -s http://TARGET/nginx_status",
       "curl -s http://TARGET/stub_status",
       "curl -s -H 'Host: ' http://TARGET/",
-      "nmap --script http-server-header -p PORT TARGET",
+      "nmap --script http-server-header -p TARGET-PORT TARGET",
       "feroxbuster -u http://TARGET -w /usr/share/seclists/Discovery/Web-Content/common.txt -x php,html,conf",
       "nuclei -u http://TARGET -tags nginx",
       "curl -s http://TARGET/%2e%2e/etc/passwd"
@@ -2232,9 +2236,9 @@
     "products": ["iis", "microsoft iis"],
     "description": "Microsoft IIS - product-specific checks",
     "commands": [
-      "nmap --script http-iis-short-name-brute -p PORT TARGET",
-      "nmap --script http-iis-webdav-vuln -p PORT TARGET",
-      "nmap --script http-webdav-scan -p PORT TARGET",
+      "nmap --script http-iis-short-name-brute -p TARGET-PORT TARGET",
+      "nmap --script http-iis-webdav-vuln -p TARGET-PORT TARGET",
+      "nmap --script http-webdav-scan -p TARGET-PORT TARGET",
       "curl -s -X OPTIONS http://TARGET/ -I",
       "feroxbuster -u http://TARGET -w /usr/share/seclists/Discovery/Web-Content/common.txt -x asp,aspx,ashx,asmx,config",
       "nuclei -u http://TARGET -tags iis",
@@ -2252,7 +2256,7 @@
       "curl -s http://TARGET:8080/manager/html",
       "curl -s http://TARGET:8080/host-manager/html",
       "curl -s http://TARGET:8080/manager/status",
-      "nmap --script http-tomcat-manager-bruteforce -p PORT TARGET",
+      "nmap --script http-tomcat-manager-bruteforce -p TARGET-PORT TARGET",
       "feroxbuster -u http://TARGET:8080 -w /usr/share/seclists/Discovery/Web-Content/common.txt -x jsp,war,txt",
       "hydra -L /usr/share/wordlists/metasploit/tomcat_mgr_default_users.txt -P /usr/share/wordlists/metasploit/tomcat_mgr_default_pass.txt http://TARGET:8080/manager/html",
       "curl -s http://TARGET:8080/WEB-INF/web.xml",

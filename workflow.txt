@@ -38,16 +38,37 @@ PHASE 2 — ANALYSIS
       ↓
 7. Playbook Matching
       • Selects enumeration commands from 120+ service playbooks
-      • Single web directory scanner: feroxbuster only
-        (ffuf / gobuster / dirsearch removed — no redundant duplicate runs)
+      • Single web directory scanner: ffuf only
+        (feroxbuster / gobuster / dirsearch removed — no redundant duplicate runs)
       • Nikto: runs with -nointeractive (output captured to stdout correctly)
       • Nuclei: runs without -t template path (uses default templates, no permission errors)
       • sslyze: runs without --regular (removed in v5.x, now default behavior)
       ↓
 8. AI Command Generation  [optional — requires --ai]
-      • Per-service prompt sent to local Ollama (default: gemma4:26b)
+      • Per-service prompt sent to local Ollama (default: qwen3:30b)
+      • Model routing controlled by --preset (see README for preset details)
+        --preset quick  → gemma4:26b for triage stages, qwen3:30b for analysis
+        --preset deep   → gemma4:26b for overview, qwen3:30b for all other stages
       • Generates additional enumeration commands not in playbooks
       • Commands filtered by service category — no cross-category hallucinations
+      ↓
+8.5. Command Sanity Check  [optional — requires --ai]
+      • Validates every generated command before it enters the suggestion list
+      • Batch call: all commands for a service sent in one LLM prompt
+      • Model: qwen3:30b (both presets; review stage)
+      • Checks each command for:
+          target_mismatch  → command targets a different host than the service
+          destructive      → flags that delete, wipe, or crash (--format, --delete, etc.)
+          noise            → overly aggressive settings (-T5, -p-, rockyou.txt brute force)
+          syntax           → malformed flags or wrong argument order
+          bruteforce       → brute force attempted before enumeration
+      • Outcomes per command:
+          approved         → passes through unchanged
+          corrected        → syntax-fixed version replaces the original
+          safer_alternative → quieter/safer substitute appended as additional suggestion
+          rejected         → operator_warning shown in report; original kept for manual review
+      • Pipeline safety: any model failure returns all-approved pass-through
+        (sanity stage never blocks the pipeline)
       ↓
 9. Risk Scoring
       • Score = f(base CVSS, host role criticality, KEV status, host count)
@@ -72,7 +93,7 @@ PHASE 3 — AI ATTACK PLAN  [optional — requires --ai]
       No profile:
         Chunked — per-service exploitability + cross-service correlation summary
 
-      Model: gemma4:26b
+      Model: qwen3:30b (default) — overridden by --preset or --ai-model
       Streaming enabled — no generation timeout, model runs until done
 
 
@@ -96,7 +117,7 @@ PHASE 5 — EXECUTION  [optional — requires --execute]
       • Substitutes TARGET / TARGET-IP / TARGET-PORT placeholders
       • Classifies each command:
           execute  → safe enumeration only
-                     (nmap scripts, feroxbuster, nikto, nuclei, curl, whatweb,
+                     (nmap scripts, ffuf, nikto, nuclei, curl, whatweb,
                       smbclient, smbmap, enum4linux, ldapsearch, snmpwalk,
                       ssh-audit, openssl, dig, smtp-user-enum, showmount, etc.)
           manual   → brute force / exploitation — shown as suggestions only

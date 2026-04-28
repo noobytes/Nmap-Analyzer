@@ -22,7 +22,7 @@ from pentest_assistant.state import CaseState, ServiceState, StatePatch
 
 
 class _FakeProvider:
-    def generate(self, prompt: str, max_tokens: int = 400) -> str:
+    def generate(self, prompt: str, max_tokens: int = 400, think: bool | None = None) -> str:
         if "Candidate approved validation actions" in prompt:
             return """
             {

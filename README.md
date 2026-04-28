@@ -1,14 +1,15 @@
 # Nmap Analyzer
 
 Turn nmap XML into actionable pentest reports — AI attack plans, CVE matching,
-risk scoring, enumeration playbooks, and optional automated safe enumeration in one tool.
+risk scoring, enumeration playbooks, command sanity checking, and optional automated
+safe enumeration in one tool.
 
 Two workflows are available:
 - `legacy` keeps the original broad attack-plan and bulk execution behavior
 - `iterative` adds a persistent analyst loop with structured observations, hypotheses, ranked approved validations, and per-result state updates
 
 Model routing is also opt-in:
-- no preset selected: current default model behavior stays unchanged
+- no preset selected: `qwen3:30b` handles all stages (default)
 - preset selected: specific workflow stages are routed automatically
 - explicit `--model` and `--review-model` override the preset routing
 
@@ -19,8 +20,9 @@ Model routing is also opt-in:
 - **CVE cross-referencing** — matches service versions against a local NVD-sourced SQLite database; ranks by relevance, CISA KEV status, and exploit type (RCE, auth bypass, privesc)
 - **Risk scoring** — prioritizes findings by service criticality, CVE severity, KEV status, and host count
 - **AI-enhanced suggestions** — optional per-service command suggestions via local Ollama
+- **Command sanity check** — every generated command is validated by `qwen3:30b` before being shown or executed; flags target mismatches, destructive flags, noise, syntax errors, and premature brute force; auto-corrects broken syntax and suggests safer alternatives
 - **Iterative analyst loop** — persistent `case_state.json`, structured facts vs hypotheses, ranked approved validation actions, and post-result state patches
-- **Opt-in model presets** — explicit presets can route network overview, profile analysis, command generation, iterative ranking, and result review stages without changing the default behavior
+- **Opt-in model presets** — `quick` and `deep` presets route each pipeline stage to the right model; explicit `--model` / `--review-model` override the preset
 - **AI Network Overview** — concise scan summary injected at the top of the report before the full attack plan
 - **AI Attack Plan / Analyst Summary** — legacy broad plan or structured iterative ranking depending on workflow
 - **Safe auto-execution** — `--execute` runs safe enumeration commands only (no brute force, no exploitation); brute force commands are kept as manual suggestions
@@ -88,7 +90,7 @@ First run does a full import (2002–current year). Subsequent runs do increment
 Ollama is **not installed automatically**. If you want AI-powered suggestions (`--ai`), install it manually:
 
 1. Download and install Ollama: https://ollama.com/download
-2. Pull a model: `ollama pull gemma4:26b`
+2. Pull the default model: `ollama pull qwen3:30b`
 3. Start the Ollama server: `ollama serve`
 
 If Ollama runs on a non-default host/port, set it in `.env`:
@@ -109,7 +111,7 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 # Basic scan analysis, no AI
 ./analyzer.sh scan.xml -C myproject
 
-# AI-assisted analysis with current default model behavior
+# AI-assisted analysis (qwen3:30b handles all stages by default)
 ./analyzer.sh scan.xml -C myproject --ai
 
 # Internal assessment profile
@@ -118,20 +120,17 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 # External assessment profile
 ./analyzer.sh scan.xml -C myproject --ai --profile external
 
-# Opt-in Qwen routing preset
-./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder
+# quick preset — gemma4:26b for overview/result_review, qwen3:30b for everything else
+./analyzer.sh scan.xml -C myproject --ai --preset quick
 
-# Opt-in Qwen + Devstral routing preset
-./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral
+# deep preset — gemma4:26b for overview only, qwen3:30b for all remaining stages
+./analyzer.sh scan.xml -C myproject --ai --preset deep
 
-# Opt-in Gemma + Qwen dual-model preset
-./analyzer.sh scan.xml -C myproject --ai --preset gemma-qwen-dual
+# Override the primary model
+./analyzer.sh scan.xml -C myproject --ai --model gemma4:26b
 
-# Override the primary routed model
-./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder --model qwen3-coder:14b
-
-# Override the routed review model
-./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral --review-model devstral-small-2:24b
+# Override the review model only
+./analyzer.sh scan.xml -C myproject --ai --preset quick --review-model gemma4:26b
 
 # Safe iterative execution
 ./analyzer.sh scan.xml -C myproject --ai --execute
@@ -169,45 +168,163 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 
 # Internal pentest profile (inside the network, lateral movement and AD focus)
 ./analyzer.sh scan.xml -C myproject --ai --profile internal
-
-# Use a larger model
-./analyzer.sh scan.xml -C myproject --ai --profile external
 ```
 
 ### Model routing and presets
 
-If you do nothing, the current default model behavior stays unchanged. The tool does not auto-switch models by task type unless you explicitly select a preset or set model flags.
+If you do nothing, all stages use `qwen3:30b`. The tool does not auto-switch models by task type unless you explicitly select a preset or set model flags.
 
 ```bash
-# Default behavior: current single-model routing stays unchanged
+# Default behavior: qwen3:30b handles all 6 stages
 ./analyzer.sh scan.xml -C myproject --ai
 
-# Route all routed stages to qwen3-coder:30b
-./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder
+# quick — gemma4:26b for network_overview + result_review,
+#         qwen3:30b for profile_analysis, command_generation,
+#         command_sanity_check, and iterative_ranking
+./analyzer.sh scan.xml -C myproject --ai --preset quick
 
-# Route network overview, profile analysis, command generation, and iterative ranking
-# to qwen3-coder:30b, with result review on devstral-small-2:24b
-./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder-devstral
-
-# Route overview/profile/command generation to gemma4:26b and
-# iterative ranking/result review to qwen2.5-coder:14b
-./analyzer.sh scan.xml -C myproject --ai --preset gemma-qwen-dual
+# deep  — gemma4:26b for network_overview only,
+#         qwen3:30b for all remaining 5 stages
+./analyzer.sh scan.xml -C myproject --ai --preset deep
 
 # Override the preset's primary model
-./analyzer.sh scan.xml -C myproject --ai --preset qwen-coder --model qwen3-coder:14b
+./analyzer.sh scan.xml -C myproject --ai --preset quick --model gemma4:26b
 
 # Override the preset's review model
-./analyzer.sh scan.xml -C myproject --ai --preset gemma-qwen-dual --review-model qwen2.5-coder:14b
+./analyzer.sh scan.xml -C myproject --ai --preset quick --review-model gemma4:26b
 ```
 
-Preset routing:
+### Preset stage routing
 
-| Preset | Network overview | Profile analysis | Command generation | Iterative ranking | Result review |
-|--------|------------------|------------------|--------------------|-------------------|---------------|
-| none | current default model | current default model | current default model | current default model | current default model |
-| `qwen-coder` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` |
-| `qwen-coder-devstral` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` | `qwen3-coder:30b` | `devstral-small-2:24b` |
-| `gemma-qwen-dual` | `gemma4:26b` | `gemma4:26b` | `gemma4:26b` | `qwen2.5-coder:14b` | `qwen2.5-coder:14b` |
+Each preset routes the 6 pipeline stages to specific models. Stages run in order for every analysis.
+
+| Stage | What it does |
+|---|---|
+| `network_overview` | 2-3 sentence plain-English scan summary injected at the top of the report |
+| `profile_analysis` | Full attack plan using the external or internal profile prompt |
+| `command_generation` | Per-service enumeration command suggestions |
+| `command_sanity_check` | Validates every generated command — flags mismatches, risky flags, noise, syntax errors, premature brute force; auto-corrects or suggests safer alternatives |
+| `iterative_ranking` | Ranks and reasons about candidate validation actions in the analyst loop |
+| `result_review` | Classifies executed command output (useful / inconclusive / negative / timeout) |
+
+**Stage routing by preset:**
+
+| Stage | none (default) | `quick` | `deep` |
+|---|---|---|---|
+| `network_overview` | `qwen3:30b` | `gemma4:26b` | `gemma4:26b` |
+| `profile_analysis` | `qwen3:30b` | `qwen3:30b` | `qwen3:30b` |
+| `command_generation` | `qwen3:30b` | `qwen3:30b` | `qwen3:30b` |
+| `command_sanity_check` | `qwen3:30b` | `qwen3:30b` | `qwen3:30b` |
+| `iterative_ranking` | `qwen3:30b` | `qwen3:30b` | `qwen3:30b` |
+| `result_review` | `qwen3:30b` | `gemma4:26b` | `qwen3:30b` |
+
+### Preset workflows in detail
+
+---
+
+#### Default — no preset (`--ai` only)
+
+One model handles all 6 stages. Simplest setup — one `ollama pull` required.
+
+```
+[network_overview]       qwen3:30b  →  scan summary
+[profile_analysis]       qwen3:30b  →  full attack plan
+[command_generation]     qwen3:30b  →  per-service commands
+[command_sanity_check]   qwen3:30b  →  validate + correct commands
+[iterative_ranking]      qwen3:30b  →  rank candidate actions
+[result_review]          qwen3:30b  →  classify command output
+```
+
+```bash
+./analyzer.sh scan.xml -C myproject --ai --profile external
+```
+
+---
+
+#### `quick` — fast bookend triage + deep reasoning for the core stages
+
+`gemma4:26b` handles the lightweight bookend tasks (scan summary and result classification).
+`qwen3:30b` drives the four middle stages that require reasoning: attack planning, command
+generation, sanity checking, and iterative ranking.
+
+```
+[network_overview]       gemma4:26b  →  scan summary           (fast triage)
+[profile_analysis]       qwen3:30b   →  full attack plan       ← deep reasoning
+[command_generation]     qwen3:30b   →  per-service commands   ← deep reasoning
+[command_sanity_check]   qwen3:30b   →  validate commands      ← deep reasoning
+[iterative_ranking]      qwen3:30b   →  rank candidate actions ← deep reasoning
+[result_review]          gemma4:26b  →  classify output        (fast triage)
+```
+
+```bash
+./analyzer.sh scan.xml -C myproject --ai --preset quick --profile external
+./analyzer.sh scan.xml -C myproject --ai --preset quick --execute --workflow iterative
+```
+
+**Best for:** Balanced speed and depth. Gemma handles the routine bookends; Qwen3 reasons through everything that matters.
+
+---
+
+#### `deep` — maximum reasoning depth across all meaningful stages
+
+`gemma4:26b` handles only the initial scan summary. `qwen3:30b` takes over for every
+stage that influences what gets run, what gets checked, and what to do next.
+
+```
+[network_overview]       gemma4:26b  →  scan summary           (quick handoff)
+[profile_analysis]       qwen3:30b   →  full attack plan       ← deep reasoning
+[command_generation]     qwen3:30b   →  per-service commands   ← deep reasoning
+[command_sanity_check]   qwen3:30b   →  validate commands      ← deep reasoning
+[iterative_ranking]      qwen3:30b   →  rank candidate actions ← deep reasoning
+[result_review]          qwen3:30b   →  classify output        ← deep reasoning
+```
+
+```bash
+# Planning pass — Qwen3 writes the attack narrative and validates every command
+./analyzer.sh scan.xml -C myproject --ai --preset deep --profile external
+
+# Execution loop — Qwen3 drives ranking, sanity checks, and result review each iteration
+./analyzer.sh scan.xml -C myproject --ai --preset deep --workflow iterative --execute
+```
+
+**Best for:** High-value engagements where you want Qwen3's reasoning applied at every decision point — from attack planning through live result interpretation.
+
+### Command Sanity Check
+
+The `command_sanity_check` stage runs automatically whenever `--ai` is enabled.
+It inspects every generated command (playbook + AI) before it is shown or executed.
+
+**What it checks:**
+
+| Issue type | Example |
+|---|---|
+| `target_mismatch` | Windows SMB tools against a Linux host; AD commands on non-domain systems; web fuzzing against a non-web port |
+| `destructive` | `-T5` timing; hydra with no rate limit against AD; excessive thread counts |
+| `noise` | Loud scans in external/stealth context; brute force during initial recon; NSE scripts that trigger EDR/SIEM |
+| `syntax` | Wrong flag names; incompatible arguments; malformed command structure |
+| `bruteforce` | Password spraying before enumeration; hydra/medusa before version detection |
+
+**What it outputs per command:**
+
+```json
+{
+  "approved": false,
+  "risk_level": "medium",
+  "issues": [{"type": "noise", "message": "-T5 is too aggressive for most engagements"}],
+  "corrected_command": "",
+  "safer_alternative": "nmap -T3 -Pn -sV --top-ports 1000 TARGET",
+  "operator_warning": "Use -T3 instead of -T5",
+  "confidence": 0.92
+}
+```
+
+**Behavior rules:**
+- `approved=true` → command passes through unchanged
+- `corrected_command` provided → broken syntax is auto-corrected in the suggestion list
+- `safer_alternative` provided → appended as an additional suggestion alongside the original
+- Warnings surface in `findings.txt` and the HTML report under **Sanity Check Warnings**
+- If the model fails or returns invalid JSON → safe pass-through, original commands unchanged
+- Never silently drops a command without explanation
 
 ### Auto-execute safe enumeration commands
 
@@ -285,7 +402,7 @@ venv/bin/python3 nmap_analyzer.py scan.xml -C myproject --ai
 
 ```
 usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
-                        [--preset {qwen-coder,qwen-coder-devstral,gemma-qwen-dual}]
+                        [--preset {quick,deep}]
                         [--profile {external,internal}] [--model AI_MODEL]
                         [--review-model REVIEW_MODEL] [--ai-key AI_KEY]
                         [--ai-timeout AI_TIMEOUT]
@@ -310,9 +427,9 @@ usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--ai [PROVIDER]` | — | Enable AI via local Ollama |
-| `--preset {qwen-coder,qwen-coder-devstral,gemma-qwen-dual}` | — | Enable opt-in stage-based model routing |
+| `--preset {quick,deep}` | — | Enable opt-in stage-based model routing |
 | `--profile {external,internal}` | — | Engagement profile for attack plan (requires `--ai`) |
-| `--model <model>` | `gemma4:26b` | Override the primary AI model |
+| `--model <model>` | `qwen3:30b` | Override the primary AI model |
 | `--review-model <model>` | — | Override the result-review model |
 | `--ai-timeout <secs>` | `10` | Ollama **connection** timeout. Generation itself has no timeout — the model runs until done. |
 | `--max-ai-commands <n>` | `8` | Max AI-generated commands per service |
@@ -360,7 +477,7 @@ Reports are saved to `reports/<project>_<timestamp>/`:
 
 | File | Description |
 |------|-------------|
-| `findings.txt` | Plain text report — all findings, commands, and attack plan |
+| `findings.txt` | Plain text report — all findings, commands, sanity warnings, and attack plan |
 | `report.html` | Self-contained interactive HTML report |
 | `ai_report.txt` | Raw AI attack plan text (when `--ai` is used) |
 | `live_findings.txt` | Ollama synthesis of execution results (when `--execute --ai`) |
@@ -398,7 +515,7 @@ Both prompts enforce the same rules:
 | Tab | Description |
 |-----|-------------|
 | **Dashboard** | Infrastructure overview, role distribution charts, risk heatmap, host inventory, pentest checklists |
-| **Suggested Action** | Per-service findings with playbook commands, AI-suggested commands, CVE matches, and risk scores |
+| **Suggested Action** | Per-service findings with playbook commands, AI-suggested commands, CVE matches, risk scores, and sanity check warnings |
 | **AI Report** | Network overview summary + per-service exploitability assessment, attack paths, quick wins, and cross-service correlation (requires `--ai`) |
 | **Live Findings** | Execution results from `--execute` mode with Ollama synthesis of all outputs |
 
@@ -406,18 +523,16 @@ Both prompts enforce the same rules:
 
 | Provider | Flag | Model (default) | Notes |
 |----------|------|-----------------|-------|
-| Ollama | `--ai` | `gemma4:26b` | Free, local, no API key needed |
+| Ollama | `--ai` | `qwen3:30b` | Free, local, no API key needed |
 
-Override the model with `--ai-model <name>`, or use a preset to route stages automatically, e.g.:
+Override the model with `--model <name>`, or use a preset to route stages automatically:
+
 ```bash
-# Gemma for overview/profile/command generation, Qwen for iterative ranking/result review
-./analyzer.sh scan.xml -C test --ai --preset gemma-qwen-dual
+# quick — gemma4:26b for bookend stages, qwen3:30b for everything in between
+./analyzer.sh scan.xml -C test --ai --preset quick
 
-# Faster, lighter option
-./analyzer.sh scan.xml -C test --ai --ai-model qwen2.5-coder:14b
-
-# Smaller Gemma variant
-./analyzer.sh scan.xml -C test --ai --ai-model gemma4:12b
+# deep  — gemma4:26b for overview only, qwen3:30b for all remaining stages
+./analyzer.sh scan.xml -C test --ai --preset deep
 ```
 
 ## Engagement Profiles
@@ -502,22 +617,27 @@ The tool auto-detects whether to run a full or incremental import based on wheth
 ## How It Works
 
 ```
-1. Nmap XML         → Parse hosts, services, versions
-2. Role Detection   → Classify hosts (Web, DC, SQL, File Server, etc.)
-3. Service Grouping → Group identical services across hosts
-4. CVE Lookup       → Match versions against local NVD database
-                       (ranked by CVSS, CISA KEV status, exploit type)
-5. Playbook Match   → Select enumeration commands from 120+ playbooks
-6. AI Commands      → (Optional) Generate additional commands per service
-7. Risk Scoring     → Prioritize by criticality, CVEs, host count
-8. AI Attack Plan   → (Optional) Network overview + comprehensive analysis:
-                       --profile external: internet-facing footprint, initial access
-                       --profile internal: lateral movement, AD chains, privesc
-                       (no profile): chunked per-service exploitability + cross-service summary
-9. Execute          → (Optional) Run safe enumeration commands locally or via SSH
-                       Brute force / exploitation kept as manual suggestions only
-10. Live Findings   → (Optional) Ollama synthesizes all execution outputs into a verdict
-11. Report          → HTML dashboard + text findings + per-command output files
+1. Nmap XML              → Parse hosts, services, versions
+2. Role Detection        → Classify hosts (Web, DC, SQL, File Server, etc.)
+3. Service Grouping      → Group identical services across hosts
+4. CVE Lookup            → Match versions against local NVD database
+                            (ranked by CVSS, CISA KEV status, exploit type)
+5. Playbook Match        → Select enumeration commands from 120+ playbooks
+6. AI Commands           → (Optional) Generate additional commands per service
+7. Command Sanity Check  → (Optional) Validate every command before surfacing:
+                            - flag target mismatches, destructive options, noise
+                            - auto-correct broken syntax
+                            - suggest safer/quieter alternatives
+                            - surface warnings in report
+8. Risk Scoring          → Prioritize by criticality, CVEs, host count
+9. AI Attack Plan        → (Optional) Network overview + comprehensive analysis:
+                            --profile external: internet-facing footprint, initial access
+                            --profile internal: lateral movement, AD chains, privesc
+                            (no profile): chunked per-service exploitability + cross-service summary
+10. Execute             → (Optional) Run safe enumeration commands locally or via SSH
+                           Brute force / exploitation kept as manual suggestions only
+11. Live Findings       → (Optional) Ollama synthesizes all execution outputs into a verdict
+12. Report              → HTML dashboard + text findings + per-command output files
 ```
 
 ## Project Structure
@@ -531,14 +651,14 @@ Nmap-Analyzer/
 ├── .env_example                   # API key template
 ├── pentest_assistant/             # Core package
 │   ├── __init__.py
-│   ├── ai.py                     # AI command generation + attack plan + synthesis
+│   ├── ai.py                     # AI command generation + sanity check + attack plan + synthesis
 │   ├── cve.py                    # CVE database lookup (KEV + exploit type aware)
 │   ├── executor.py               # Safe execution engine + SSH ControlMaster
-│   ├── models.py                 # Data models (Service, Host, Finding, etc.)
+│   ├── models.py                 # Data models (Service, Host, Finding, SanityCheckResult, etc.)
 │   ├── parser.py                 # Nmap XML parser
 │   ├── pipeline.py               # Main analysis pipeline
 │   ├── playbooks.py              # Enumeration playbook matcher
-│   ├── providers.py              # AI provider abstraction (Ollama)
+│   ├── providers.py              # AI provider abstraction (Ollama) + stage routing
 │   ├── reporting.py              # HTML + text report generation
 │   └── role_detection.py         # Host role classification
 ├── data/
@@ -547,8 +667,10 @@ Nmap-Analyzer/
 ├── reports/                       # Auto-created; one subfolder per run
 ├── tests/
 │   ├── test_assistant.py
+│   ├── test_command_sanity_check.py
 │   ├── test_cve_updater.py
 │   ├── test_dashboard.py
+│   ├── test_model_routing.py
 │   └── test_reporting.py
 └── update_cve_db.py               # NVD feed downloader + importer
 ```
@@ -564,7 +686,7 @@ After the initial CVE feed download:
 ## Running Tests
 
 ```bash
-./venv/bin/python -m pytest tests/ -v
+./venv/bin/python -m unittest discover tests/ -v
 ```
 
 ## Troubleshooting
@@ -574,7 +696,7 @@ After the initial CVE feed download:
 | `ModuleNotFoundError` | Run `python3 setup.py` or `pip install -r requirements.txt` |
 | `CVE database not found` | Run `./analyzer.sh --cve-db-update` |
 | `Ollama unavailable` | Install from https://ollama.com/download, pull a model, run `ollama serve` |
-| `Ollama model not found` | Run `ollama pull gemma4:26b` or specify another with `--ai-model` |
+| `Ollama model not found` | Run `ollama pull qwen3:30b` or specify another with `--model` |
 | AI Report tab empty | Model is still running — no timeout on generation. Check `logs/` for errors. |
 | `stream idle timeout` | Fixed in current version (`read=None` on streaming). Update your copy. |
 | SSH connection refused | Ensure `sshd` is running on the remote host: `sudo systemctl start ssh` |

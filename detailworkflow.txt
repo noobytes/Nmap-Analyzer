@@ -38,7 +38,7 @@ Step 1.3 — Pre-flight File Checks
 
 Step 1.4 — AI Provider Pre-flight (if --ai)
   Pings Ollama at http://127.0.0.1:11434/api/tags (or OLLAMA_HOST env var).
-  Checks that the configured model (default: gemma4:26b) is downloaded.
+  Checks that the configured model (default: qwen3:30b) is downloaded.
   If Ollama is unreachable or the model is missing, AI is disabled and
   the tool continues with playbooks and CVE matching only.
 
@@ -50,7 +50,7 @@ Step 1.5 — AnalysisConfig Assembly
     cve_db_path        → data/cve_database.db
     playbook_path      → data/enumeration_playbooks.json
     ai_provider        → "ollama" or None
-    ai_model           → gemma4:26b (default)
+    ai_model           → qwen3:30b (default)
     profile            → "external", "internal", or None
     execute            → True/False
     max_exec_commands  → 30 (default)
@@ -123,6 +123,7 @@ Step 3.1 — Role Classification Rules (evaluated in priority order)
   SQL Server         → mssql in any service/product text, OR port 1433
   Web Server         → http/https in any service name, OR ports {80,443,8080,8443}
   File Server        → smb/microsoft-ds/netbios in text, OR port 445
+  Mail Server        → smtp/imap/pop3/submission in text, OR ports {25,465,587,993,995}
   Linux Server       → ssh in text, OR port 22
   Workstation        → rdp/ms-wbt-server/winrm in text, OR port 3389
   Unknown            → none of the above matched
@@ -243,7 +244,7 @@ Step 6.1 — Playbook Structure
       "ports": [80, 443, 8080],
       "commands": [
         "nikto -h http://TARGET -nointeractive",
-        "feroxbuster -u http://TARGET -w /usr/share/seclists/...",
+        "ffuf -u http://TARGET/FUZZ -w /usr/share/seclists/...",
         "nuclei -u http://TARGET -tags apache"
       ]
     }
@@ -268,7 +269,7 @@ Step 6.4 — Command Deduplication
   Already-seen commands are skipped (set-based deduplication).
 
 Step 6.5 — Tool Policies Applied in Playbooks
-  feroxbuster  → sole web directory brute-force scanner
+  ffuf         → sole web directory brute-force scanner (feroxbuster → manual)
   nikto        → -nointeractive flag (output goes to stdout, not file)
   nuclei       → no -t template path (uses default templates, no permission error)
   sslyze       → no --regular flag (removed in v5.x)
@@ -332,6 +333,99 @@ Step 7.5 — Category Relevance Filter
 Step 7.6 — Caching
   Results cached by service.group_key + role so the same service
   never triggers a second AI call in the same run.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 7.5 — COMMAND SANITY CHECK
+File: pentest_assistant/ai.py → CommandSanityChecker.check()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Only runs when --ai is set. Inserted between AI Command Generation and Risk
+Scoring. On any model failure, the checker passes all commands through
+unchanged (approved=True) — the pipeline is never blocked by this stage.
+
+Step 7.5.1 — Batch Prompt Construction
+  All playbook and AI commands for a service are combined into a single
+  deduplicated list and submitted to the model in one call.
+  This avoids N+1 API calls for services with many commands.
+
+  The prompt includes:
+    • Service context: port, protocol, name, product, version
+    • Host roles assigned to this service
+    • Engagement profile (external / internal / unset), with profile-specific notes
+    • All commands numbered 1..N
+    • Explicit JSON schema for the expected response
+
+Step 7.5.2 — Model and Routing
+  Model: qwen3:30b (used in both quick and deep presets — this is a review stage).
+  The stage key is "command_sanity_check" in MODEL_STAGES.
+  In both presets, "command_sanity_check" is in review_stages, so it always
+  gets the review model (qwen3:30b) regardless of the preset's primary model.
+
+Step 7.5.3 — Expected JSON Schema (per command)
+  The model returns a JSON array, one object per command:
+
+  [
+    {
+      "approved":           true | false,
+      "risk_level":         "low" | "medium" | "high",
+      "issues": [
+        { "type": "noise | syntax | bruteforce | destructive | target_mismatch",
+          "message": "human-readable explanation" }
+      ],
+      "corrected_command":  "",   // syntax-fixed version; empty if not needed
+      "safer_alternative":  "",   // quieter substitute; empty if not needed
+      "operator_warning":   "",   // warning shown to operator in report
+      "confidence":         0.95  // model confidence in this judgement (0.0-1.0)
+    },
+    ...
+  ]
+
+Step 7.5.4 — Response Parsing and Coercion (_parse_response)
+  • Strips <think>...</think> tags and markdown code fences
+  • Attempts JSON parse of the response
+  • If JSON parse fails → returns all-approved pass-through for all commands
+  • If the array is shorter than the command list → pads missing entries with
+    approved pass-through (partial model output is handled gracefully)
+  • Unknown issue types → coerced to "syntax"
+  • Unknown risk levels → coerced to "low"
+
+Step 7.5.5 — Pipeline Integration
+  After check() returns, the pipeline applies corrections:
+    correction_map: original_command → corrected_command
+      (only populated when corrected_command is set and differs from original)
+
+  playbook_cmds and ai_cmds are updated via the correction map:
+    [correction_map.get(c, c) for c in playbook_cmds]
+
+  safer_alternatives: commands in sr.safer_alternative for rejected commands
+  (where no corrected_command was provided) are appended to ai_cmds if not
+  already present. This ensures safer alternatives appear in the suggestion list.
+
+  sanity_check_results (the full list of SanityCheckResult objects) is stored
+  on the ServiceFinding for display in reports.
+
+Step 7.5.6 — Logging Behavior
+  WARNING  → command rejected (approved=False)
+  INFO     → command corrected (corrected_command applied)
+  DEBUG    → command flagged medium/high risk but approved
+  WARNING  → model call raised an exception (pass-through fallback activated)
+
+Step 7.5.7 — Report Surfacing
+  build_text_report() (reporting.py) appends a "Sanity Check Warnings:" block
+  under each service finding when any command was rejected, corrected,
+  flagged medium/high, or has an operator_warning.
+
+  Format per flagged command:
+    [REJECTED]       <templated command>
+      Issue: <type>: <message>
+      Operator warning: <text>
+      Safer alternative: <command>
+
+    [WARN [MEDIUM]]  <templated command>
+      Issue: <type>: <message>
+      Operator warning: <text>
+      Corrected: <corrected_command>
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -534,7 +628,7 @@ Step 11.3 — Classification
     • No brute force patterns matched
 
     EXECUTE_TOOLS includes:
-      nmap, curl, wget, whatweb, nikto, nuclei, feroxbuster, wpscan,
+      nmap, curl, wget, whatweb, nikto, nuclei, ffuf, wpscan,
       sslscan, sslyze, testssl.sh, enum4linux, enum4linux-ng, smbclient,
       smbmap, rpcclient, crackmapexec, nxc, ldapsearch, snmpwalk,
       snmp-check, ssh-audit, showmount, rpcinfo, mysql, redis-cli,
@@ -587,7 +681,7 @@ Step 12.1 — Tool Availability Check
   Collects all unique tool names from PlannedCommand objects.
   Builds a single shell one-liner that checks all tools at once:
     command -v nikto >/dev/null 2>&1 && echo 'OK:nikto' || echo 'MISSING:nikto';
-    command -v feroxbuster >/dev/null ... etc.
+    command -v ffuf >/dev/null ... etc.
   Runs via SSH (if remote) or local subprocess.
   Parses OK:/MISSING: markers to build {tool_name: bool} result.
 
@@ -617,7 +711,7 @@ File: pentest_assistant/executor.py → ExecutionEngine.run()
 Step 13.1 — Health Check Thread
   A background thread starts immediately at execution begin.
   Every 20 seconds it wakes and prints:
-    [health] [03/15] feroxbuster → 192.168.1.10 (80/tcp/http): RUNNING (42s elapsed)
+    [health] [03/15] ffuf → 192.168.1.10 (80/tcp/http): RUNNING (42s elapsed)
   When a command finishes, the status label is updated immediately.
   The thread is stopped cleanly after all commands complete.
 
@@ -799,9 +893,21 @@ CVEEntry (frozen dataclass)
 CommandSuggestion (frozen dataclass)
   command, source ("playbook" or "ai"), confidence (0.0-1.0)
 
+SanityCheckResult (dataclass)
+  command            → the original command that was checked
+  approved           → True if the command passed, False if rejected
+  risk_level         → "low" | "medium" | "high"
+  issues             → list of {"type": str, "message": str} dicts
+                       issue types: target_mismatch, destructive, noise, syntax, bruteforce
+  corrected_command  → syntax-fixed version; empty string if not applicable
+  safer_alternative  → quieter substitute command; empty string if not applicable
+  operator_warning   → human-readable warning displayed in the report
+  confidence         → model confidence in this judgement (0.0-1.0)
+
 ServiceFinding (dataclass)
   service, ips, cves, playbook_commands, ai_commands,
-  command_suggestions, playbook_confidence, ai_confidence, risk_score
+  command_suggestions, playbook_confidence, ai_confidence, risk_score,
+  sanity_check_results  → list[SanityCheckResult] (empty when --ai not set)
 
 PlannedCommand (dataclass)
   command, service_label, target_ip, tool
@@ -834,6 +940,22 @@ OllamaProvider.generate(prompt, max_tokens):
   • Streams tokens via iter_lines(), accumulates into string
   • Detects {"error": "..."} chunks and raises RuntimeError
   • Logs warning if empty response received
+
+Model Preset System:
+  --preset quick    → primary: gemma4:26b (network_overview, result_review)
+                      review:  qwen3:30b  (profile_analysis, command_generation,
+                                           command_sanity_check, iterative_ranking)
+
+  --preset deep     → primary: gemma4:26b (network_overview only)
+                      review:  qwen3:30b  (all other stages, including result_review)
+
+  --ai-model <model>     → overrides primary model for all non-review stages
+  --review-model <model> → overrides review model for review stages
+  No preset              → all stages use default model: qwen3:30b
+
+  Stage order:
+    network_overview → profile_analysis → command_generation →
+    command_sanity_check → iterative_ranking → result_review
 
 Timeout behavior:
   --ai-timeout  → controls TCP connection timeout only (default: 10s)
