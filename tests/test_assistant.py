@@ -99,7 +99,7 @@ class PlaybookTests(unittest.TestCase):
 
         # Product-specific rule should be the top match
         self.assertEqual(match.matched_rules[0], "http_apache")
-        self.assertIn("curl -s http://TARGET/server-status", match.commands)
+        self.assertIn("curl --max-time 10 --connect-timeout 5 -s http://TARGET/server-status", match.commands)
         # Generic http commands should also be included
         self.assertIn("whatweb TARGET", match.commands)
         # Confidence should be higher than without product match

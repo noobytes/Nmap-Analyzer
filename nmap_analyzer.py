@@ -162,6 +162,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--regenerate-report", metavar="REPORT_DIR",
         help="Regenerate report.html from an existing report folder without re-running any scans or AI calls (e.g. --regenerate-report reports/myproject_20260428_221239)",
     )
+    output_group.add_argument(
+        "--screenshot", action="store_true",
+        help="Capture web screenshots with gowitness after analysis. Requires gowitness on the scanning host (remote when --remote-host is set, otherwise local).",
+    )
 
     # --- Logging / debug ---
     log_group = parser.add_argument_group("logging")
@@ -768,6 +772,35 @@ def main() -> int:
             result.manual_suggestions = plan.manual_suggestions
             if plan.commands and not should_run:
                 print("Execution skipped.")
+
+    # --- Screenshot capture (gowitness) ---
+    if args.screenshot and args.scan:
+        from pentest_assistant.screenshot import GoWitnessRunner
+        from pentest_assistant.executor import SSHConfig as _SSHConfig
+
+        _ssh_cfg = None
+        if args.remote_host:
+            _ssh_cfg = _SSHConfig(
+                host=args.remote_host,
+                port=args.remote_port,
+                key_path=args.remote_key,
+            )
+
+        print("\nCapturing web screenshots with gowitness...")
+        gw_runner = GoWitnessRunner(
+            report_dir=report_dir,
+            nmap_xml=args.scan[0],
+            ssh_config=_ssh_cfg,
+        )
+        gw_result = gw_runner.run()
+        if gw_result.error:
+            print(f"  gowitness warning: {gw_result.error}", file=sys.stderr)
+        else:
+            result.screenshot_result = gw_result
+            svc_count = len(gw_result.services)
+            print(f"  {svc_count} web service(s) captured")
+            if gw_result.html_path:
+                print(f"  screenshots/ → {gw_result.html_path}")
 
     # --- Save reports ---
     report_dir.mkdir(parents=True, exist_ok=True)
