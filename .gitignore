@@ -34,6 +34,10 @@ data/cve_database.db-wal
 
 # Claude Code
 .claude/
+memory/
+
+# Personal / session notes
+TODO.md
 
 # Build artifacts
 *.egg-info/
