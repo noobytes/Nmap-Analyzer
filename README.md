@@ -23,14 +23,14 @@ Model routing is also opt-in:
 - **Command sanity check** — every generated command is validated by `qwen3:30b` before being shown or executed; flags target mismatches, destructive flags, noise, syntax errors, and premature brute force; auto-corrects broken syntax and suggests safer alternatives
 - **Iterative analyst loop** — persistent `case_state.json`, structured facts vs hypotheses, ranked approved validation actions, and post-result state patches
 - **Opt-in model presets** — `quick` and `deep` presets route each pipeline stage to the right model; explicit `--model` / `--review-model` override the preset
-- **AI Network Overview** — concise scan summary injected at the top of the report before the full attack plan
+- **AI Network Overview** — concise scan summary injected at the top of the AI Analysis Report tab
 - **AI Attack Plan / Analyst Summary** — legacy broad plan or structured iterative ranking depending on workflow
 - **Safe auto-execution** — `--execute` runs safe enumeration commands only (no brute force, no exploitation); brute force commands are kept as manual suggestions
 - **SSH remote execution** — `--remote-host kali@IP` runs all commands on a remote Kali box via SSH ControlMaster while Ollama stays on your local machine
 - **Live Findings tab** — execution results displayed in the HTML report with Ollama synthesis of all outputs
 - **Case-state persistence** — iterative workflow state can be resumed from a saved JSON file
 - **Pre-flight checks** — validates tool availability and passwordless sudo before executing
-- **Self-contained HTML report** — interactive tabbed dashboard (Dashboard, Suggested Action, AI Report, Live Findings)
+- **Self-contained HTML report** — interactive tabbed report (Network Summary, Suggested Action, AI Analysis Report, Live Findings)
 - **File logging** — every run writes a full debug log to `logs/run_<timestamp>.log`
 - **Robust** — handles any nmap XML (empty scans, tcpwrapped services, closed ports, malformed data)
 
@@ -39,14 +39,14 @@ Model routing is also opt-in:
 - **Python 3.10+** (tested on 3.11, 3.12, 3.14)
 - **Nmap** — to generate XML scan files (`nmap -oX`)
 - **Git** — to clone the repository
-- **(Optional) Ollama** — for local AI suggestions (`--ai`). Must be installed manually by the user — see [ollama.com/download](https://ollama.com/download)
+- **(Optional) Ollama** — for local AI suggestions (`--ai`). Must be installed manually — see [ollama.com/download](https://ollama.com/download)
 
 ## Installation
 
 ### Step 1: Clone the repository
 
 ```bash
-git clone https://github.com/noobytes/Nmap-Analyzer.git
+git clone https://github.com/lzyh00ps/Nmap-Analyzer.git
 cd Nmap-Analyzer
 ```
 
@@ -200,7 +200,7 @@ Each preset routes the 6 pipeline stages to specific models. Stages run in order
 
 | Stage | What it does |
 |---|---|
-| `network_overview` | 2-3 sentence plain-English scan summary injected at the top of the report |
+| `network_overview` | 2-3 sentence plain-English scan summary injected at the top of the AI Analysis Report tab |
 | `profile_analysis` | Full attack plan using the external or internal profile prompt |
 | `command_generation` | Per-service enumeration command suggestions |
 | `command_sanity_check` | Validates every generated command — flags mismatches, risky flags, noise, syntax errors, premature brute force; auto-corrects or suggests safer alternatives |
@@ -415,11 +415,15 @@ usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
                         [--max-exec-commands MAX_EXEC_COMMANDS]
                         [--workflow {iterative,legacy}]
                         [--iterative-batch-size ITERATIVE_BATCH_SIZE]
+                        [--host-batch-size HOST_BATCH_SIZE]
+                        [--min-action-value MIN_ACTION_VALUE]
+                        [--max-noise-streak MAX_NOISE_STREAK]
                         [--no-confirm] [--case-state CASE_STATE]
                         [--remote-host USER@HOST] [--remote-key PATH]
                         [--remote-port REMOTE_PORT] [--playbooks PLAYBOOKS]
+                        [--wordlist PATH]
                         [--log-level {DEBUG,INFO,WARNING,ERROR}] [--debug]
-                        [scan]
+                        [scan ...]
 ```
 
 #### AI options
@@ -445,6 +449,9 @@ usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
 | `--max-exec-commands <n>` | `30` | Max commands to auto-execute |
 | `--workflow {iterative,legacy}` | auto | Workflow selection. Auto = iterative when `--ai` and `--execute` are both enabled, else legacy |
 | `--iterative-batch-size <n>` | `1` | Max approved commands per iterative loop (capped at 3) |
+| `--host-batch-size <n>` | `5` | Max concurrent hosts per SSH batch (limits tmux windows opened per iteration) |
+| `--min-action-value <score>` | `0.0` | Skip candidates scored below this expected_value (0–10, 0 = disabled) |
+| `--max-noise-streak <n>` | `6` | Stop loop early after N consecutive noise/inconclusive results (auto-set to 10 for internal, 4 for external) |
 | `--no-confirm` | off | Skip the confirmation prompt before executing |
 | `--case-state <path>` | report dir | Save or resume iterative workflow state |
 | `--remote-host USER@HOST` | — | Run commands on a remote host via SSH |
@@ -468,6 +475,7 @@ usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
 |------|---------|-------------|
 | `-C, --project <name>` | — | Project name — reports go to `reports/<name>_<timestamp>/` |
 | `--playbooks <path>` | `data/enumeration_playbooks.json` | Custom playbooks file |
+| `--wordlist <path>` | — | Wordlist for web content fuzzing (ffuf, feroxbuster, etc.). Defaults to common.txt |
 | `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 | `--debug` | off | Shortcut for `--log-level DEBUG` |
 
@@ -485,7 +493,7 @@ Reports are saved to `reports/<project>_<timestamp>/`:
 | `enumeration/` | Per-command output files (when `--execute` is used) |
 | `logs/run_<timestamp>.log` | Full DEBUG log for every run |
 
-The iterative report now includes:
+The iterative report includes:
 - confirmed findings
 - likely findings
 - ruled-out hypotheses
@@ -514,10 +522,25 @@ Both prompts enforce the same rules:
 
 | Tab | Description |
 |-----|-------------|
-| **Dashboard** | Infrastructure overview, role distribution charts, risk heatmap, host inventory, pentest checklists |
+| **Network Summary** | Infrastructure overview — KPI cards (hosts, ports, services, CVEs, highest CVSS), severity distribution chart, host role chart, service exposure chart, Top 10 TCP Ports table, vulnerability table with filters, top group targets, service groups, attack path indicators, and pentest checklists |
 | **Suggested Action** | Per-service findings with playbook commands, AI-suggested commands, CVE matches, risk scores, and sanity check warnings |
-| **AI Report** | Network overview summary + per-service exploitability assessment, attack paths, quick wins, and cross-service correlation (requires `--ai`) |
-| **Live Findings** | Execution results from `--execute` mode with Ollama synthesis of all outputs |
+| **AI Analysis Report** | Network overview summary + per-service exploitability assessment, Host-by-Host Analysis table, attack paths, quick wins, and cross-service correlation (requires `--ai`) |
+| **Live Findings** | Execution results from `--execute` mode with Ollama synthesis of all outputs (requires `--execute`) |
+
+#### Network Summary tab sections
+
+| Section | Content |
+|---------|---------|
+| **SECTION 1 — Network Overview** | AI-generated scan summary + KPI cards |
+| **SECTION 2 — Severity Distribution** | Donut chart; click a slice to filter the vulnerability table |
+| **SECTION 3 — Service Exposure** | Bar chart of protocol exposure counts |
+| **SECTION 3b — Top 10 TCP Ports** | Table of most-seen TCP ports with host counts and a prevalence bar |
+| **SECTION 4 — Host Roles** | Bar chart of host role distribution |
+| **SECTION 5 — Vulnerability Table** | Filterable/sortable CVE table (search, severity filter, exploit filter) |
+| **Top Group Targets** | Hosts grouped by role + CVE profile, sorted by aggregate risk score |
+| **SECTION 6 — Service Groups** | Service/version groups across all hosts with CVE hit counts |
+| **SECTION 7 — Attack Path Indicators** | SMB+LDAP pivot candidates, Domain Controllers, exposed RDP, vulnerable web hosts |
+| **SECTION 8 — Pentest Checklist Panel** | Role-specific pentest checklist cards |
 
 ## AI Provider
 
@@ -566,7 +589,8 @@ Profiles control the AI Attack Plan analysis. Pass `--profile` alongside `--ai`.
 **SSH remote execution** (`--remote-host`):
 - Opens a single SSH ControlMaster connection — all commands reuse it (no repeated handshakes)
 - Ollama AI stays on your local machine; only the enumeration commands run remotely
-- Use this when your Kali attack box is separate from the machine running the tool
+- Each command runs in its own tmux window — survives SSH disconnects
+- Watch live: `ssh kali@IP -t 'tmux attach -t nmap-<pid>'`
 
 ```bash
 # Typical workflow: Mac running Ollama + Nmap Analyzer → Kali executing commands
@@ -587,6 +611,9 @@ nmap -sV -sC -p- -T3 --open -oX scan.xml TARGET_RANGE
 
 # UDP essentials
 nmap -sU -sV --top-ports 20 --open -oX udp_scan.xml TARGET_RANGE
+
+# Multiple files — merged by IP automatically
+./analyzer.sh fast.xml full.xml -C myproject --ai
 ```
 
 ## CVE Database
@@ -660,7 +687,8 @@ Nmap-Analyzer/
 │   ├── playbooks.py              # Enumeration playbook matcher
 │   ├── providers.py              # AI provider abstraction (Ollama) + stage routing
 │   ├── reporting.py              # HTML + text report generation
-│   └── role_detection.py         # Host role classification
+│   ├── role_detection.py         # Host role classification
+│   └── prompts/                  # Structured prompt templates for iterative workflow
 ├── data/
 │   └── enumeration_playbooks.json # 120+ service playbooks
 ├── logs/                          # Auto-created; run_<timestamp>.log per run
@@ -670,6 +698,7 @@ Nmap-Analyzer/
 │   ├── test_command_sanity_check.py
 │   ├── test_cve_updater.py
 │   ├── test_dashboard.py
+│   ├── test_iterative_workflow.py
 │   ├── test_model_routing.py
 │   └── test_reporting.py
 └── update_cve_db.py               # NVD feed downloader + importer
@@ -679,7 +708,6 @@ Nmap-Analyzer/
 
 After the initial CVE feed download:
 - Scan analysis works fully offline using `data/cve_database.db`
-- CVE updates can use cached feeds with `--cve-offline`
 - AI features (Ollama) run fully locally — no network access required
 - `--execute` with `--remote-host` only needs SSH access to the remote box
 
@@ -697,7 +725,8 @@ After the initial CVE feed download:
 | `CVE database not found` | Run `./analyzer.sh --cve-db-update` |
 | `Ollama unavailable` | Install from https://ollama.com/download, pull a model, run `ollama serve` |
 | `Ollama model not found` | Run `ollama pull qwen3:30b` or specify another with `--model` |
-| AI Report tab empty | Model is still running — no timeout on generation. Check `logs/` for errors. |
+| AI Analysis Report tab empty | Model is still running — no timeout on generation. Check `logs/` for errors. |
+| `WARNING: Ollama returned an empty response` | Model ran out of token budget. Use `--model` to switch to a smaller/faster model, or check Ollama logs. |
 | `stream idle timeout` | Fixed in current version (`read=None` on streaming). Update your copy. |
 | SSH connection refused | Ensure `sshd` is running on the remote host: `sudo systemctl start ssh` |
 | Tool not found on remote | Install missing tools on the Kali box, e.g. `sudo apt install ffuf` |
