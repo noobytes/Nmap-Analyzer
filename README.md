@@ -78,12 +78,38 @@ mkdir -p data/nvd_feeds reports logs
 
 ### Step 4: Build the CVE database (recommended)
 
+The CVE database is not included in the repository — you build it locally from the NVD API.
+
+**First run (full build):**
+
 ```bash
 ./analyzer.sh --cve-db-update
 ```
 
-This downloads NVD JSON feeds and builds a local SQLite database at `data/cve_database.db`.
-First run does a full import (2002–current year). Subsequent runs do incremental updates.
+This pulls pentest-relevant CVEs from the NVD REST API (2018–present) and the CISA Known Exploited Vulnerabilities catalog, then writes them to `data/cve_database.db`. Only CVEs that are actionable for pentesting are stored — CISA KEV entries plus CVEs with a classifiable exploit type (RCE, auth bypass, privesc, SQLi, etc.) and CVSS ≥ 6.0.
+
+> **Without an NVD API key** the API enforces a 5-request/30s rate limit, which adds a ~6 second pause between each batch. A full build typically takes **20–40 minutes** on a clean install.
+>
+> **With a free NVD API key** the limit rises to 50 requests/30s — the same build finishes in **2–4 minutes**.
+>
+> Get a free key at: https://nvd.nist.gov/developers/request-an-api-key
+
+```bash
+# Recommended: first run with an API key
+./analyzer.sh --cve-db-update --nvd-api-key YOUR_KEY_HERE
+
+# Or set the key as an env var so you don't have to type it each time
+export NVD_API_KEY=YOUR_KEY_HERE
+./analyzer.sh --cve-db-update
+```
+
+**Subsequent runs (incremental — fast):**
+
+```bash
+./analyzer.sh --cve-db-update
+```
+
+After the database exists, the same command automatically switches to incremental mode — it only fetches CVEs published or modified since the last update. This typically completes in under a minute.
 
 ### Step 5: Set up Ollama (optional, for AI features)
 
@@ -618,28 +644,47 @@ nmap -sU -sV --top-ports 20 --open -oX udp_scan.xml TARGET_RANGE
 
 ## CVE Database
 
-The tool uses a local SQLite database (`data/cve_database.db`) sourced from official NVD JSON feeds.
-CVEs are enriched with exploit type classification (RCE, auth bypass, privesc, SQLi, etc.) and CISA KEV status for improved ranking.
+The tool uses a local SQLite database (`data/cve_database.db`) built from the NVD REST API and the CISA Known Exploited Vulnerabilities catalog. Only pentest-relevant CVEs are stored — CISA KEV entries plus CVEs with a classifiable exploit type (RCE, auth bypass, privesc, SQLi, SSRF, etc.) and CVSS ≥ 6.0.
+
+### First run — full build (2018–present)
 
 ```bash
-# Build from scratch (first run — downloads all feeds from 2002)
+# Without API key — works but slow (~20–40 min, NVD rate-limits to 5 req/30s)
 ./analyzer.sh --cve-db-update
 
-# Incremental update (only modified + recent feeds)
-./analyzer.sh --cve-db-update
-
-# Force full rebuild
-./analyzer.sh --cve-db-update --cve-rebuild
-
-# With NVD API key for ~10× faster downloads (free key)
+# With free NVD API key — ~10× faster (~2–4 min, 50 req/30s)
 ./analyzer.sh --cve-db-update --nvd-api-key YOUR_KEY_HERE
 
-# Direct updater script
+# Or export the key so every future run picks it up automatically
+export NVD_API_KEY=YOUR_KEY_HERE
+./analyzer.sh --cve-db-update
+```
+
+Get a free NVD API key at: https://nvd.nist.gov/developers/request-an-api-key
+
+The tool auto-detects that no database exists and runs a full import. Output goes to `data/cve_database.db`.
+
+### Subsequent runs — incremental update (fast)
+
+```bash
+./analyzer.sh --cve-db-update
+```
+
+Once the database exists, the same command switches to incremental mode automatically — it only fetches CVEs published or modified since the last update. Typically completes in under a minute.
+
+### Other database commands
+
+```bash
+# Force a full rebuild from scratch (drops and recreates tables)
+./analyzer.sh --cve-db-update --cve-rebuild
+
+# Full rebuild covering a specific year range
+./analyzer.sh --cve-db-update --cve-rebuild --cve-start-year 2015
+
+# Run the updater directly (bypasses analyzer.sh)
 venv/bin/python3 update_cve_db.py --mode full --rebuild
 venv/bin/python3 update_cve_db.py --mode incremental
 ```
-
-The tool auto-detects whether to run a full or incremental import based on whether the DB exists.
 
 ## How It Works
 
