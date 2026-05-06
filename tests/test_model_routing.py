@@ -22,6 +22,7 @@ class ModelRoutingTests(unittest.TestCase):
             "command_sanity_check",
             "iterative_ranking",
             "result_review",
+            "report_writing",
         ):
             self.assertEqual(
                 get_model_for_stage(stage, resolved),
@@ -44,6 +45,7 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(get_model_for_stage("command_generation", resolved), "qwen3:30b")
         self.assertEqual(get_model_for_stage("command_sanity_check", resolved), "qwen3:30b")
         self.assertEqual(get_model_for_stage("iterative_ranking", resolved), "qwen3:30b")
+        self.assertEqual(get_model_for_stage("report_writing", resolved), "gemma4:26b")
 
     def test_deep_preset_stage_routing(self) -> None:
         config = AnalysisConfig(ai_provider="ollama", preset="deep")
@@ -60,6 +62,7 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(get_model_for_stage("command_sanity_check", resolved), "qwen3:30b")
         self.assertEqual(get_model_for_stage("iterative_ranking", resolved), "qwen3:30b")
         self.assertEqual(get_model_for_stage("result_review", resolved), "qwen3:30b")
+        self.assertEqual(get_model_for_stage("report_writing", resolved), "gemma4:26b")
 
     def test_command_sanity_check_stage_exists_and_is_routable(self) -> None:
         """command_sanity_check must be a recognised stage in all routing modes."""
@@ -122,6 +125,7 @@ class ModelRoutingTests(unittest.TestCase):
             "command_sanity_check",
             "iterative_ranking",
             "result_review",
+            "report_writing",
         ):
             self.assertEqual(get_model_for_stage(stage, resolved), "custom-primary:14b")
 
@@ -139,6 +143,7 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(get_model_for_stage("command_sanity_check", resolved), DEFAULT_MODELS["ollama"])
         self.assertEqual(get_model_for_stage("iterative_ranking", resolved), DEFAULT_MODELS["ollama"])
         self.assertEqual(get_model_for_stage("result_review", resolved), "custom-review:8b")
+        self.assertEqual(get_model_for_stage("report_writing", resolved), DEFAULT_MODELS["ollama"])
 
     @patch("nmap_analyzer.get_missing_stage_models")
     def test_missing_model_error_handling_for_stage_based_routing(self, missing_models_mock) -> None:

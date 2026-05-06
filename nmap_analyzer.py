@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pentest_assistant.agents.report_writing import ReportWritingAgent
 from pentest_assistant.pipeline import AnalysisConfig, analyze_scan
 from pentest_assistant.providers import (
     DEFAULT_MODELS,
@@ -76,6 +77,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="Override the review model used for result-review stages.",
     )
+    ai_group.add_argument("--rag", action="store_true", help="Enable local RAG retrieval for AI agents.")
+    ai_group.add_argument("--rag-rebuild", action="store_true", help="Rebuild the local vector database before analysis.")
+    ai_group.add_argument("--rag-strict", action="store_true", help="Fail hard if RAG retrieval or embeddings are unavailable.")
+    ai_group.add_argument("--rag-top-k", type=int, default=5, help="Number of retrieved chunks per service/agent context (default: 5).")
+    ai_group.add_argument("--knowledge-dir", default="pentest_assistant/knowledge", help="Path to local markdown knowledge files.")
+    ai_group.add_argument("--rag-db-path", default=".nmap_analyzer/chroma", help="Path to the persistent ChromaDB directory.")
+    ai_group.add_argument("--embedding-model", default="nomic-embed-text", help="Local Ollama embedding model (default: nomic-embed-text).")
     ai_group.add_argument("--ai-key", default=None, help="API key for AI provider (or use env vars)")
     ai_group.add_argument("--ai-timeout", type=float, default=10.0, help="Ollama connection timeout in seconds (default: 10). Generation itself has no timeout — the model runs until done.")
     ai_group.add_argument("--max-ai-commands", type=int, default=8, help="Max AI commands per service (default: 8)")
@@ -101,12 +109,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Execute safe enumeration commands against scan targets (requires confirmation)",
     )
     exec_group.add_argument(
+        "--dry-run", action="store_true",
+        help="Plan the iterative workflow and write case_state.json without executing commands.",
+    )
+    exec_group.add_argument(
+        "--manual-only", action="store_true",
+        help="Never auto-execute commands. Keep medium/high-risk and operator-review actions as manual_only.",
+    )
+    exec_group.add_argument(
         "--exec-timeout", type=float, default=60.0,
         help="Timeout per command in seconds (default: 60)",
     )
     exec_group.add_argument(
         "--max-exec-commands", type=int, default=30,
         help="Max commands to execute automatically (default: 30)",
+    )
+    exec_group.add_argument(
+        "--max-steps", type=int, default=0,
+        help="Max iterative workflow steps to take. 0 means no extra step cap.",
     )
     exec_group.add_argument(
         "--workflow", choices=["iterative", "legacy"], default=None,
@@ -532,7 +552,7 @@ def main() -> int:
 
     resolved_workflow = args.workflow
     if resolved_workflow is None:
-        resolved_workflow = "iterative" if (args.execute and ai_provider) else "legacy"
+        resolved_workflow = "iterative" if ((args.execute or args.dry_run or args.manual_only) and ai_provider) else "legacy"
 
     timestamp = run_timestamp
     if args.project:
@@ -555,8 +575,18 @@ def main() -> int:
         ai_timeout_seconds=max(1.0, args.ai_timeout),
         max_ai_commands=max(0, args.max_ai_commands),
         profile=args.profile,
+        rag_enabled=args.rag,
+        rag_rebuild=args.rag_rebuild,
+        rag_strict=args.rag_strict,
+        rag_top_k=max(1, args.rag_top_k),
+        knowledge_dir=args.knowledge_dir,
+        rag_db_path=args.rag_db_path,
+        embedding_model=args.embedding_model,
         execute=args.execute,
+        dry_run=args.dry_run,
+        manual_only=args.manual_only,
         max_exec_commands=max(1, args.max_exec_commands),
+        max_steps=max(0, args.max_steps),
         workflow=resolved_workflow,
         iterative_batch_size=max(1, min(args.iterative_batch_size, 3)),
         host_batch_size=max(1, args.host_batch_size),
@@ -566,6 +596,24 @@ def main() -> int:
         resolved_models=resolved_models,
         wordlist=args.wordlist,
     )
+
+    if args.rag_rebuild:
+        try:
+            from pentest_assistant.rag.ingest import ingest_knowledge
+
+            count = ingest_knowledge(
+                knowledge_dir=args.knowledge_dir,
+                db_path=args.rag_db_path,
+                embedding_model=args.embedding_model,
+                reset=True,
+            )
+            print(f"RAG knowledge rebuilt: {count} chunks indexed.", file=sys.stderr)
+        except Exception as exc:
+            message = f"RAG rebuild failed: {exc}"
+            if args.rag_strict:
+                print(message, file=sys.stderr)
+                return 1
+            print(f"Warning: {message}. Continuing without rebuilt RAG.", file=sys.stderr)
 
     try:
         result = analyze_scan(args.scan if len(args.scan) > 1 else args.scan[0], config)
@@ -580,11 +628,16 @@ def main() -> int:
     print(text_report)
 
     # --- Execution phase ---
-    if args.execute and result.execution_plan:
+    if (args.execute or args.dry_run or args.manual_only) and result.execution_plan:
         plan = result.execution_plan
         _print_execution_plan(plan, remote_host=args.remote_host)
 
-        should_run = bool(plan.commands) and (args.no_confirm or _confirm_execution())
+        should_run = bool(plan.commands) and args.execute and not args.dry_run and not args.manual_only and (args.no_confirm or _confirm_execution())
+        if args.dry_run:
+            print("Dry-run mode: no commands executed. Ranked safe actions were written to case_state.json.")
+        elif args.manual_only:
+            print("Manual-only mode: auto-execution disabled. Review the suggested commands in the report and case_state.json.")
+
         if should_run:
             from pentest_assistant.executor import (
                 ExecutionEngine, SSHConfig, SSHMaster,
@@ -621,6 +674,9 @@ def main() -> int:
 
                 tool_status = check_tools_available(tools_needed, master_ctx)
                 sudo_ok = check_sudo_passwordless(master_ctx)
+                available_tools = sorted(tool for tool, ok in tool_status.items() if ok)
+                if result.case_state is not None and available_tools:
+                    result.case_state.approved_tools = available_tools
 
                 missing = [t for t, ok in tool_status.items() if not ok]
                 if missing:
@@ -674,6 +730,7 @@ def main() -> int:
                     ranking_provider=stage_providers.get("iterative_ranking"),
                     review_provider=stage_providers.get("result_review"),
                     max_exec_commands=config.max_exec_commands,
+                    max_steps=config.max_steps,
                     batch_size=config.iterative_batch_size,
                     output_dir=report_dir,
                     execution_runner=engine.run,
@@ -803,6 +860,21 @@ def main() -> int:
                 print(f"  screenshots/ → {gw_result.html_path}")
 
     # --- Save reports ---
+    if ai_provider and result.live_findings:
+        try:
+            report_stage_providers = create_stage_providers(
+                ai_provider,
+                resolved_models=resolved_models,
+                stages=["report_writing"],
+                api_key=args.ai_key or None,
+                timeout=args.ai_timeout,
+            )
+            report_provider = report_stage_providers.get("report_writing")
+            if report_provider is not None:
+                result.live_findings = ReportWritingAgent(report_provider).run(result.live_findings)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Report writing stage failed: %s", exc)
+
     report_dir.mkdir(parents=True, exist_ok=True)
     text_report = build_text_report(result)
     text_path = report_dir / "findings.txt"

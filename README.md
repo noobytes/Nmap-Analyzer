@@ -4,6 +4,9 @@ Turn nmap XML into actionable pentest reports — AI attack plans, CVE matching,
 risk scoring, enumeration playbooks, command sanity checking, and optional automated
 safe enumeration in one tool.
 
+The current implementation keeps the original parser, reporting, and Ollama integration,
+but refactors the AI path into an explicit multi-agent workflow for authorized pentesting.
+
 Two workflows are available:
 - `legacy` keeps the original broad attack-plan and bulk execution behavior
 - `iterative` adds a persistent analyst loop with structured observations, hypotheses, ranked approved validations, and per-result state updates
@@ -13,6 +16,192 @@ Model routing is also opt-in:
 - preset selected: specific workflow stages are routed automatically
 - explicit `--model` and `--review-model` override the preset routing
 
+## Multi-Agent Architecture
+
+- `network_overview` — `gemma4:26b`; summarizes Nmap XML results, identifies live hosts, exposed services, likely roles, and obvious concerns; does not generate commands
+- `profile_analysis` — `qwen3:30b`; analyzes the environment as `internal` or `external`, infers likely roles, prioritizes attack-path hypotheses, and recommends safe validation steps
+- `command_generation` — `qwen3:30b`; generates safe enumeration commands only, with command, purpose, target, expected evidence, risk, auto-execution intent, and reason
+- `command_sanity_check` — `qwen3:30b`; reviews every generated command and enforces strict command safety policy
+- `iterative_ranking` — `qwen3:30b`; ranks the next best low-risk evidence-building actions from `case_state.json`
+- `result_review` — `gemma4:26b` in `quick`, `qwen3:30b` in `deep`; classifies command output as useful, negative, inconclusive, timeout, or error
+- `evidence_to_finding` — `qwen3:30b`; converts only sufficiently confirmed evidence into report-ready findings
+- `report_writing` — `gemma4:26b`; improves report language for evidence-backed findings only and cannot invent new findings
+
+Shared routing, schema, JSON repair, case-state, and safety helpers live under `pentest_assistant/core/`.
+
+## Safety Model
+
+- Authorized testing only.
+- No exploit automation.
+- No brute-force automation.
+- No destructive or denial-of-service actions.
+- Every generated command passes through `command_sanity_check`.
+- Obvious dangerous patterns such as `rm -rf`, `shutdown`, `reboot`, `hydra`, `medusa`, `ncrack`, `sqlmap --os-shell`, `msfconsole exploit`, `hping3 flood`, and `--script dos` are blocked.
+- `--script vuln` is never auto-executed.
+- Only low-risk read-only enumeration commands are auto-execution candidates.
+- Medium and high risk commands are forced to `manual_only`.
+- JSON-returning agents are validated strictly, retried once with a correction prompt, and failures are recorded without crashing the whole run.
+
+## Phase 2: Local RAG Knowledge Base
+
+Phase 2 adds local retrieval-augmented generation so the assistant can use:
+
+- pentest playbooks
+- reporting language templates
+- methodology notes
+- service-specific validation guidance
+
+RAG improves consistency and depth, but it is supporting context only. Retrieved knowledge is never proof. Confirmed Nmap evidence and command output always take priority. Findings still require evidence tied to a known asset.
+
+### Local dependencies
+
+```bash
+pip install chromadb
+ollama pull nomic-embed-text
+```
+
+### Knowledge ingestion
+
+```bash
+python -m pentest_assistant.rag.ingest --knowledge-dir pentest_assistant/knowledge --reset
+```
+
+### RAG-enabled analysis
+
+```bash
+./analyzer.sh scan.xml -C client --ai --preset deep --profile internal --rag
+./analyzer.sh scan.xml -C client --ai --preset deep --profile internal --workflow iterative --rag --dry-run
+./analyzer.sh scan.xml -C client --ai --preset deep --profile internal --workflow iterative --rag --execute --max-steps 5
+```
+
+### RAG rules
+
+- If `--rag` is not enabled, existing behavior remains unchanged.
+- If ChromaDB or Ollama embeddings are unavailable, the tool warns and continues without RAG unless `--rag-strict` is used.
+- Commands surfaced from retrieved playbooks still go through `command_sanity_check`.
+- Retrieved knowledge can improve analysis and reporting language, but it cannot create findings by itself.
+
+## Phase 2B: Structured Playbook Intelligence
+
+Phase 2B upgrades `data/enumeration_playbooks.json` into a first-class structured RAG source alongside the markdown knowledge base.
+
+It adds:
+- structured JSON playbook ingestion into ChromaDB
+- per-command risk classification
+- service normalization and alias mapping
+- contextual retrieval for internal vs external profiles
+- safer command recommendation ranking
+
+### What it does
+
+- Loads service entries from `data/enumeration_playbooks.json`
+- Converts them into readable embedded chunks with metadata such as service, ports, context, category, aliases, and tools
+- Classifies each playbook command as `low`, `medium`, `high`, `manual_only`, or `blocked`
+- Prioritizes low-risk, evidence-building commands during retrieval and iterative planning
+
+### Safety model for structured playbooks
+
+- The JSON playbook is a knowledge source, not an auto-execution source
+- Retrieved commands still require `command_sanity_check`
+- `manual_only` means the command may be shown for analyst consideration but must not auto-execute
+- Blocked commands are never recommended for automatic execution
+- Brute force, spraying, exploitation, shell access, and destructive actions remain outside auto-execution
+
+### CLI examples
+
+```bash
+./analyzer.sh scan.xml --rag
+./analyzer.sh scan.xml --rag --profile internal
+./analyzer.sh scan.xml --rag --workflow iterative --dry-run
+./analyzer.sh scan.xml --rag --execute --max-steps 5
+```
+
+## Phase 2C: Safety and Workflow Unification
+
+Phase 2C hardens the command lifecycle so safety is authoritative across legacy execution, iterative execution, playbooks, AI output, and RAG retrieval.
+
+### What changed
+
+- `command_sanity_check` now fails closed; if the stage fails, commands are blocked instead of approved
+- one canonical command policy engine classifies risk for executor, RAG, and sanity enforcement
+- direct local `shell=True` execution has been removed from command execution paths
+- scope validation is mandatory before execution
+- legacy `--execute` now uses the same approved `command_suggestions` lifecycle as iterative mode
+- RAG knowledge is treated as untrusted reference material and wrapped in explicit prompt boundaries
+- playbook and retrieved commands never bypass `command_sanity_check`
+
+### Safety rules in practice
+
+- No direct playbook execution
+- No direct AI command execution
+- No direct RAG command execution
+- No auto-execution for `high`, `manual_only`, or `blocked` commands
+- `medium` risk commands remain manual by default, except controlled web content discovery with bounded safety defaults
+- Only in-scope, safely parsed, sanity-approved enumeration commands can auto-execute
+
+### Example low-risk commands
+
+```bash
+curl -I http://TARGET
+sslscan TARGET:443
+nmap --script ssl-enum-ciphers -p 443 TARGET
+```
+
+### Example blocked or manual-only commands
+
+```bash
+hydra -L users.txt -P rockyou.txt ssh://TARGET
+msfconsole exploit
+nmap -sV TARGET && whoami
+gobuster dir -u http://TARGET -w list.txt
+```
+
+## Web Content Discovery Strategy
+
+Autonomous web content discovery is intentionally narrow to reduce duplicate results, target load, and review noise.
+
+### Preferred tool order
+
+- `ffuf` is the primary autonomous web discovery tool
+- `feroxbuster` is the fallback autonomous tool only when `ffuf` is unavailable
+- `gobuster` and `dirsearch` remain compatibility/manual recommendations only
+
+### Why only one primary fuzzer
+
+- Running multiple equivalent directory fuzzers against the same target creates duplicate findings, extra noise, and unnecessary load
+- The iterative workflow tracks prior fuzzing in `case_state.json` so the same host/path is not fuzzed repeatedly unless the surface changes
+- Retrieved playbook commands are normalized toward one preferred implementation where possible
+
+### Safety defaults
+
+- `ffuf` auto-execution is allowed only when the command is scoped, rate-limited, timeout-limited, and non-recursive
+- `feroxbuster` is treated as fallback-only and must stay shallow and rate-limited
+- `gobuster` and `dirsearch` are downgraded to manual recommendations by default
+- All web discovery commands still pass `command_policy`, `command_sanity_check`, and `scope_guard`
+- Shell chaining, metacharacters, wildcard targets, and broad fuzzing remain blocked
+
+### Safe autonomous examples
+
+```bash
+ffuf -u http://TARGET/FUZZ -w /usr/share/seclists/Discovery/Web-Content/common.txt -ac -mc 200,204,301,302,307,401,403 -t 10 -rate 50 -timeout 10
+feroxbuster -u http://TARGET -w /usr/share/seclists/Discovery/Web-Content/common.txt -t 10 -r --depth 1 --rate-limit 50
+```
+
+### Normalization examples
+
+These commands may still appear in playbooks or RAG context, but autonomous orchestration will normalize or downgrade them:
+
+```bash
+gobuster dir -u http://TARGET -w WORDLIST
+dirsearch -u http://TARGET -w WORDLIST
+```
+
+Normalized preferred equivalent:
+
+```bash
+ffuf -u http://TARGET/FUZZ -w WORDLIST -ac -mc 200,204,301,302,307,401,403 -t 10 -rate 50 -timeout 10
+```
+
 ## Features
 
 - **Infrastructure role detection** — groups hosts by role (Web Server, Domain Controller, File Server, SQL Server, etc.)
@@ -21,11 +210,13 @@ Model routing is also opt-in:
 - **Risk scoring** — prioritizes findings by service criticality, CVE severity, KEV status, and host count
 - **AI-enhanced suggestions** — optional per-service command suggestions via local Ollama
 - **Command sanity check** — every generated command is validated by `qwen3:30b` before being shown or executed; flags target mismatches, destructive flags, noise, syntax errors, and premature brute force; auto-corrects broken syntax and suggests safer alternatives
+- **Strict JSON validation** — JSON agents are parsed strictly, retried once on malformed output, then marked failed without crashing the entire workflow
 - **Iterative analyst loop** — persistent `case_state.json`, structured facts vs hypotheses, ranked approved validation actions, and post-result state patches
 - **Opt-in model presets** — `quick` and `deep` presets route each pipeline stage to the right model; explicit `--model` / `--review-model` override the preset
 - **AI Network Overview** — concise scan summary injected at the top of the AI Analysis Report tab
 - **AI Attack Plan / Analyst Summary** — legacy broad plan or structured iterative ranking depending on workflow
-- **Safe auto-execution** — `--execute` runs safe enumeration commands only (no brute force, no exploitation); brute force commands are kept as manual suggestions
+- **Safe auto-execution** — `--execute` runs safe enumeration only; `--dry-run` plans without execution; `--manual-only` disables auto-execution entirely
+- **Local RAG support** — optional ChromaDB-backed retrieval using Ollama embeddings (`nomic-embed-text`) with persistent local storage
 - **SSH remote execution** — `--remote-host kali@IP` runs all commands on a remote Kali box via SSH ControlMaster while Ollama stays on your local machine
 - **Live Findings tab** — execution results displayed in the HTML report with Ollama synthesis of all outputs
 - **Case-state persistence** — iterative workflow state can be resumed from a saved JSON file
@@ -161,8 +352,17 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 # Safe iterative execution
 ./analyzer.sh scan.xml -C myproject --ai --execute
 
+# Dry-run iterative planning only
+./analyzer.sh scan.xml -C myproject --ai --workflow iterative --dry-run
+
+# Manual-only iterative planning
+./analyzer.sh scan.xml -C myproject --ai --workflow iterative --manual-only
+
 # Iterative execution with a batch of 2 approved steps
 ./analyzer.sh scan.xml -C myproject --ai --execute --workflow iterative --iterative-batch-size 2
+
+# Cap the iterative workflow to 5 steps
+./analyzer.sh scan.xml -C myproject --ai --execute --workflow iterative --max-steps 5
 
 # Resume an iterative case from a saved state file
 ./analyzer.sh scan.xml -C myproject --ai --execute --case-state reports/<run>/case_state.json
@@ -175,6 +375,11 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 
 # Update the CVE database and analyze in one run
 ./analyzer.sh --cve-db-update scan.xml -C myproject --ai
+
+# Requested examples
+./analyzer.sh scan.xml -C client --ai --preset quick --profile external
+./analyzer.sh scan.xml -C client --ai --preset deep --profile internal --workflow iterative --dry-run
+./analyzer.sh scan.xml -C client --ai --preset deep --profile internal --workflow iterative --execute --max-steps 5
 ```
 
 ### Basic analysis (playbooks only, no AI)
@@ -201,16 +406,16 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 If you do nothing, all stages use `qwen3:30b`. The tool does not auto-switch models by task type unless you explicitly select a preset or set model flags.
 
 ```bash
-# Default behavior: qwen3:30b handles all 6 stages
+# Default behavior: qwen3:30b handles all 7 stages
 ./analyzer.sh scan.xml -C myproject --ai
 
 # quick — gemma4:26b for network_overview + result_review,
 #         qwen3:30b for profile_analysis, command_generation,
-#         command_sanity_check, and iterative_ranking
+#         command_sanity_check, iterative_ranking, and evidence_to_finding
 ./analyzer.sh scan.xml -C myproject --ai --preset quick
 
 # deep  — gemma4:26b for network_overview only,
-#         qwen3:30b for all remaining 5 stages
+#         qwen3:30b for all remaining 6 stages
 ./analyzer.sh scan.xml -C myproject --ai --preset deep
 
 # Override the preset's primary model
@@ -222,7 +427,7 @@ If you do nothing, all stages use `qwen3:30b`. The tool does not auto-switch mod
 
 ### Preset stage routing
 
-Each preset routes the 6 pipeline stages to specific models. Stages run in order for every analysis.
+Each preset routes the 7 pipeline stages to specific models. Stages run in order for every analysis.
 
 | Stage | What it does |
 |---|---|
@@ -232,6 +437,7 @@ Each preset routes the 6 pipeline stages to specific models. Stages run in order
 | `command_sanity_check` | Validates every generated command — flags mismatches, risky flags, noise, syntax errors, premature brute force; auto-corrects or suggests safer alternatives |
 | `iterative_ranking` | Ranks and reasons about candidate validation actions in the analyst loop |
 | `result_review` | Classifies executed command output (useful / inconclusive / negative / timeout) |
+| `evidence_to_finding` | Converts only sufficiently confirmed evidence into report-ready findings |
 
 **Stage routing by preset:**
 
@@ -243,6 +449,7 @@ Each preset routes the 6 pipeline stages to specific models. Stages run in order
 | `command_sanity_check` | `qwen3:30b` | `qwen3:30b` | `qwen3:30b` |
 | `iterative_ranking` | `qwen3:30b` | `qwen3:30b` | `qwen3:30b` |
 | `result_review` | `qwen3:30b` | `gemma4:26b` | `qwen3:30b` |
+| `evidence_to_finding` | `qwen3:30b` | `qwen3:30b` | `qwen3:30b` |
 
 ### Preset workflows in detail
 
@@ -250,7 +457,7 @@ Each preset routes the 6 pipeline stages to specific models. Stages run in order
 
 #### Default — no preset (`--ai` only)
 
-One model handles all 6 stages. Simplest setup — one `ollama pull` required.
+One model handles all 7 stages. Simplest setup — one `ollama pull` required.
 
 ```
 [network_overview]       qwen3:30b  →  scan summary
@@ -259,6 +466,7 @@ One model handles all 6 stages. Simplest setup — one `ollama pull` required.
 [command_sanity_check]   qwen3:30b  →  validate + correct commands
 [iterative_ranking]      qwen3:30b  →  rank candidate actions
 [result_review]          qwen3:30b  →  classify command output
+[evidence_to_finding]    qwen3:30b  →  draft confirmed findings
 ```
 
 ```bash

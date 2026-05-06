@@ -11,6 +11,7 @@ REQUIREMENTS = [
     "plotly",
     "defusedxml",
     "httpx",
+    "chromadb",
 ]
 
 
