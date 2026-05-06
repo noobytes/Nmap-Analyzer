@@ -406,7 +406,7 @@ The `analyzer.sh` script auto-loads `.env` on startup.
 If you do nothing, all stages use `qwen3:30b`. The tool does not auto-switch models by task type unless you explicitly select a preset or set model flags.
 
 ```bash
-# Default behavior: qwen3:30b handles all 7 stages
+# Default behavior: qwen3:30b handles all 8 stages
 ./analyzer.sh scan.xml -C myproject --ai
 
 # quick — gemma4:26b for network_overview + result_review,
@@ -427,7 +427,7 @@ If you do nothing, all stages use `qwen3:30b`. The tool does not auto-switch mod
 
 ### Preset stage routing
 
-Each preset routes the 7 pipeline stages to specific models. Stages run in order for every analysis.
+Each preset routes the 8 pipeline stages to specific models. Stages run in order for every analysis.
 
 | Stage | What it does |
 |---|---|
@@ -438,6 +438,7 @@ Each preset routes the 7 pipeline stages to specific models. Stages run in order
 | `iterative_ranking` | Ranks and reasons about candidate validation actions in the analyst loop |
 | `result_review` | Classifies executed command output (useful / inconclusive / negative / timeout) |
 | `evidence_to_finding` | Converts only sufficiently confirmed evidence into report-ready findings |
+| `report_writing` | Polishes wording for evidence-backed findings only; cannot invent or upgrade findings |
 
 **Stage routing by preset:**
 
@@ -450,6 +451,7 @@ Each preset routes the 7 pipeline stages to specific models. Stages run in order
 | `iterative_ranking` | `qwen3:30b` | `qwen3:30b` | `qwen3:30b` |
 | `result_review` | `qwen3:30b` | `gemma4:26b` | `qwen3:30b` |
 | `evidence_to_finding` | `qwen3:30b` | `qwen3:30b` | `qwen3:30b` |
+| `report_writing` | `qwen3:30b` | `gemma4:26b` | `gemma4:26b` |
 
 ### Preset workflows in detail
 
@@ -457,7 +459,7 @@ Each preset routes the 7 pipeline stages to specific models. Stages run in order
 
 #### Default — no preset (`--ai` only)
 
-One model handles all 7 stages. Simplest setup — one `ollama pull` required.
+One model handles all 8 stages. Simplest setup — one `ollama pull` required.
 
 ```
 [network_overview]       qwen3:30b  →  scan summary
@@ -467,6 +469,7 @@ One model handles all 7 stages. Simplest setup — one `ollama pull` required.
 [iterative_ranking]      qwen3:30b  →  rank candidate actions
 [result_review]          qwen3:30b  →  classify command output
 [evidence_to_finding]    qwen3:30b  →  draft confirmed findings
+[report_writing]         qwen3:30b  →  improve evidence-backed wording
 ```
 
 ```bash
@@ -488,6 +491,7 @@ generation, sanity checking, and iterative ranking.
 [command_sanity_check]   qwen3:30b   →  validate commands      ← deep reasoning
 [iterative_ranking]      qwen3:30b   →  rank candidate actions ← deep reasoning
 [result_review]          gemma4:26b  →  classify output        (fast triage)
+[report_writing]         gemma4:26b  →  polish report wording  (fast synthesis)
 ```
 
 ```bash
@@ -511,6 +515,7 @@ stage that influences what gets run, what gets checked, and what to do next.
 [command_sanity_check]   qwen3:30b   →  validate commands      ← deep reasoning
 [iterative_ranking]      qwen3:30b   →  rank candidate actions ← deep reasoning
 [result_review]          qwen3:30b   →  classify output        ← deep reasoning
+[report_writing]         gemma4:26b  →  polish report wording
 ```
 
 ```bash
@@ -557,7 +562,7 @@ It inspects every generated command (playbook + AI) before it is shown or execut
 - `corrected_command` provided → broken syntax is auto-corrected in the suggestion list
 - `safer_alternative` provided → appended as an additional suggestion alongside the original
 - Warnings surface in `findings.txt` and the HTML report under **Sanity Check Warnings**
-- If the model fails or returns invalid JSON → safe pass-through, original commands unchanged
+- If the model fails, times out, or returns invalid JSON → fail closed; the command is blocked with `sanity_check_failed`
 - Never silently drops a command without explanation
 
 ### Auto-execute safe enumeration commands
@@ -588,8 +593,17 @@ In this mode the tool:
 # Default iterative mode when both --ai and --execute are enabled
 ./analyzer.sh scan.xml -C myproject --ai --execute
 
+# Explicit dry-run: build recommendations, case state, and report artifacts without running commands
+./analyzer.sh scan.xml -C myproject --ai --workflow iterative --dry-run
+
+# Explicit manual-only mode: keep recommendations but never auto-execute them
+./analyzer.sh scan.xml -C myproject --ai --workflow iterative --manual-only
+
 # Explicit iterative mode with a tiny batch of 2 steps per loop
 ./analyzer.sh scan.xml -C myproject --ai --execute --workflow iterative --iterative-batch-size 2
+
+# Cap the loop to five iterations even if more approved actions remain
+./analyzer.sh scan.xml -C myproject --ai --execute --workflow iterative --max-steps 5
 
 # Resume a previous iterative run from its saved state
 ./analyzer.sh scan.xml -C myproject --ai --execute \
@@ -634,28 +648,27 @@ venv/bin/python3 nmap_analyzer.py scan.xml -C myproject --ai
 
 ### All available options
 
-```
-usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
-                        [--preset {quick,deep}]
+```text
+usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]] [--preset {quick,deep}]
                         [--profile {external,internal}] [--model AI_MODEL]
-                        [--review-model REVIEW_MODEL] [--ai-key AI_KEY]
-                        [--ai-timeout AI_TIMEOUT]
+                        [--review-model REVIEW_MODEL] [--rag] [--rag-rebuild] [--rag-strict]
+                        [--rag-top-k RAG_TOP_K] [--knowledge-dir KNOWLEDGE_DIR]
+                        [--rag-db-path RAG_DB_PATH] [--embedding-model EMBEDDING_MODEL]
+                        [--ai-key AI_KEY] [--ai-timeout AI_TIMEOUT]
                         [--max-ai-commands MAX_AI_COMMANDS] [--cve-db-update]
-                        [--cve-rebuild]
-                        [--cve-update-mode {auto,full,incremental}]
+                        [--cve-rebuild] [--cve-update-mode {auto,full,incremental}]
                         [--cve-force-download] [--nvd-api-key NVD_API_KEY]
-                        [--min-cvss MIN_CVSS] [--execute]
-                        [--exec-timeout EXEC_TIMEOUT]
-                        [--max-exec-commands MAX_EXEC_COMMANDS]
-                        [--workflow {iterative,legacy}]
+                        [--min-cvss MIN_CVSS] [--execute] [--dry-run] [--manual-only]
+                        [--exec-timeout EXEC_TIMEOUT] [--max-exec-commands MAX_EXEC_COMMANDS]
+                        [--max-steps MAX_STEPS] [--workflow {iterative,legacy}]
                         [--iterative-batch-size ITERATIVE_BATCH_SIZE]
                         [--host-batch-size HOST_BATCH_SIZE]
                         [--min-action-value MIN_ACTION_VALUE]
-                        [--max-noise-streak MAX_NOISE_STREAK]
-                        [--no-confirm] [--case-state CASE_STATE]
-                        [--remote-host USER@HOST] [--remote-key PATH]
-                        [--remote-port REMOTE_PORT] [--playbooks PLAYBOOKS]
-                        [--wordlist PATH]
+                        [--max-noise-streak MAX_NOISE_STREAK] [--no-confirm]
+                        [--case-state CASE_STATE] [--remote-host USER@HOST]
+                        [--remote-key PATH] [--remote-port REMOTE_PORT]
+                        [--playbooks PLAYBOOKS] [--wordlist PATH]
+                        [--regenerate-report REPORT_DIR] [--screenshot]
                         [--log-level {DEBUG,INFO,WARNING,ERROR}] [--debug]
                         [scan ...]
 ```
@@ -669,6 +682,13 @@ usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
 | `--profile {external,internal}` | — | Engagement profile for attack plan (requires `--ai`) |
 | `--model <model>` | `qwen3:30b` | Override the primary AI model |
 | `--review-model <model>` | — | Override the result-review model |
+| `--rag` | off | Enable local RAG retrieval for AI agents |
+| `--rag-rebuild` | off | Rebuild the Chroma knowledge database before analysis |
+| `--rag-strict` | off | Fail hard if retrieval or embeddings are unavailable |
+| `--rag-top-k <n>` | `5` | Retrieved chunks per service or prompt context |
+| `--knowledge-dir <path>` | `pentest_assistant/knowledge` | Local markdown knowledge directory |
+| `--rag-db-path <path>` | `.nmap_analyzer/chroma` | Persistent ChromaDB path |
+| `--embedding-model <model>` | `nomic-embed-text` | Local Ollama embedding model |
 | `--ai-timeout <secs>` | `10` | Ollama **connection** timeout. Generation itself has no timeout — the model runs until done. |
 | `--max-ai-commands <n>` | `8` | Max AI-generated commands per service |
 
@@ -679,8 +699,11 @@ usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--execute` | off | Execute safe enumeration commands (prompts for confirmation) |
+| `--dry-run` | off | Build the iterative plan and `case_state.json` without executing commands |
+| `--manual-only` | off | Never auto-execute commands; keep actions as analyst-reviewed recommendations |
 | `--exec-timeout <secs>` | `60` | Per-command timeout during execution |
 | `--max-exec-commands <n>` | `30` | Max commands to auto-execute |
+| `--max-steps <n>` | `0` | Hard cap on iterative workflow steps (`0` = no extra cap) |
 | `--workflow {iterative,legacy}` | auto | Workflow selection. Auto = iterative when `--ai` and `--execute` are both enabled, else legacy |
 | `--iterative-batch-size <n>` | `1` | Max approved commands per iterative loop (capped at 3) |
 | `--host-batch-size <n>` | `5` | Max concurrent hosts per SSH batch (limits tmux windows opened per iteration) |
@@ -710,6 +733,8 @@ usage: nmap_analyzer.py [-h] [-C PROJECT] [--ai [PROVIDER]]
 | `-C, --project <name>` | — | Project name — reports go to `reports/<name>_<timestamp>/` |
 | `--playbooks <path>` | `data/enumeration_playbooks.json` | Custom playbooks file |
 | `--wordlist <path>` | — | Wordlist for web content fuzzing (ffuf, feroxbuster, etc.). Defaults to common.txt |
+| `--regenerate-report <report_dir>` | — | Rebuild `report.html` from an existing report directory without re-running scans or AI |
+| `--screenshot` | off | Capture web screenshots with `gowitness` after analysis |
 | `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 | `--debug` | off | Shortcut for `--log-level DEBUG` |
 
@@ -808,12 +833,16 @@ Profiles control the AI Attack Plan analysis. Pass `--profile` alongside `--ai`.
 `--execute` automatically runs safe enumeration commands against the scan targets after confirmation.
 
 **What runs automatically:**
-- Port scanning (nmap scripts), web probing (curl, nikto, nuclei, ffuf)
+- Port scanning and read-only fingerprinting (`nmap`, `curl`, `whatweb`, `httpx`, `sslscan`)
+- Controlled web content discovery with bounded `ffuf`
+- Controlled `feroxbuster` only when `ffuf` is unavailable
 - SMB/LDAP/SNMP enumeration, SSH audit, DNS queries, service fingerprinting
 
 **What stays as manual suggestions only (never auto-run):**
 - Brute force (hydra, medusa, hashcat, etc.)
 - Exploitation (sqlmap, metasploit, impacket wmiexec/psexec, etc.)
+- `gobuster` and `dirsearch` by default
+- Broad, recursive, credentialed, or noisy commands
 
 **Pre-flight checks** run before execution:
 - Verifies all required tools are installed on the target system
@@ -831,6 +860,29 @@ Profiles control the AI Attack Plan analysis. Pass `--profile` alongside `--ai`.
 ./analyzer.sh scan.xml -C engagement --ai --profile internal \
   --execute --remote-host kali@10.10.10.5 --remote-key ~/.ssh/kali
 ```
+
+## Regenerate Existing Report
+
+If you already have a report directory and only want to rebuild `report.html` without re-running scans, AI, or execution:
+
+```bash
+./analyzer.sh --regenerate-report reports/myproject_20260506_120000
+```
+
+This is useful after template or reporting changes.
+
+## Screenshot Capture
+
+Use `--screenshot` to capture web screenshots with `gowitness` after analysis:
+
+```bash
+./analyzer.sh scan.xml -C myproject --ai --screenshot
+./analyzer.sh scan.xml -C myproject --ai --execute --remote-host kali@10.10.10.5 --screenshot
+```
+
+Notes:
+- `gowitness` must be installed on the machine that performs the screenshot step
+- with `--remote-host`, screenshots run from the remote host
 
 ## Recommended Nmap Syntax
 
@@ -902,22 +954,18 @@ venv/bin/python3 update_cve_db.py --mode incremental
 3. Service Grouping      → Group identical services across hosts
 4. CVE Lookup            → Match versions against local NVD database
                             (ranked by CVSS, CISA KEV status, exploit type)
-5. Playbook Match        → Select enumeration commands from 120+ playbooks
-6. AI Commands           → (Optional) Generate additional commands per service
-7. Command Sanity Check  → (Optional) Validate every command before surfacing:
-                            - flag target mismatches, destructive options, noise
-                            - auto-correct broken syntax
-                            - suggest safer/quieter alternatives
-                            - surface warnings in report
-8. Risk Scoring          → Prioritize by criticality, CVEs, host count
-9. AI Attack Plan        → (Optional) Network overview + comprehensive analysis:
-                            --profile external: internet-facing footprint, initial access
-                            --profile internal: lateral movement, AD chains, privesc
-                            (no profile): chunked per-service exploitability + cross-service summary
-10. Execute             → (Optional) Run safe enumeration commands locally or via SSH
-                           Brute force / exploitation kept as manual suggestions only
-11. Live Findings       → (Optional) Ollama synthesizes all execution outputs into a verdict
-12. Report              → HTML dashboard + text findings + per-command output files
+5. Playbook + RAG        → Select static playbooks plus optional markdown/JSON RAG context
+6. Network Overview      → (Optional) Summarize the scanned environment
+7. Profile Analysis      → (Optional) Apply internal or external pentest reasoning
+8. Command Generation    → (Optional) Generate additional safe enumeration commands
+9. Command Policy        → Canonical risk classification and normalization
+10. Sanity Check         → (Optional) Fail-closed AI review of every command
+11. Scope Guard          → Validate target, placeholders, and in-scope execution
+12. Iterative Ranking    → Prefer the next smallest evidence-building action
+13. Result Review        → Interpret command output and patch case state
+14. Evidence to Finding  → Convert only confirmed evidence into findings
+15. Report Writing       → Improve wording for evidence-backed findings only
+16. Report               → HTML dashboard + text findings + per-command output files
 ```
 
 ## Project Structure
@@ -931,29 +979,36 @@ Nmap-Analyzer/
 ├── .env_example                   # API key template
 ├── pentest_assistant/             # Core package
 │   ├── __init__.py
-│   ├── ai.py                     # AI command generation + sanity check + attack plan + synthesis
-│   ├── cve.py                    # CVE database lookup (KEV + exploit type aware)
-│   ├── executor.py               # Safe execution engine + SSH ControlMaster
-│   ├── models.py                 # Data models (Service, Host, Finding, SanityCheckResult, etc.)
-│   ├── parser.py                 # Nmap XML parser
-│   ├── pipeline.py               # Main analysis pipeline
-│   ├── playbooks.py              # Enumeration playbook matcher
-│   ├── providers.py              # AI provider abstraction (Ollama) + stage routing
-│   ├── reporting.py              # HTML + text report generation
-│   ├── role_detection.py         # Host role classification
-│   └── prompts/                  # Structured prompt templates for iterative workflow
+│   ├── ai.py                      # Prompt builders + AI command generation + sanity enforcement
+│   ├── analysis_loop.py           # Iterative workflow, ranking, result review, and state patching
+│   ├── cve.py                     # CVE database lookup (KEV + exploit type aware)
+│   ├── executor.py                # Execution orchestration + SSH ControlMaster support
+│   ├── models.py                  # Data models (Service, Host, Finding, SanityCheckResult, etc.)
+│   ├── parser.py                  # Nmap XML parser
+│   ├── pipeline.py                # Main analysis pipeline
+│   ├── playbooks.py               # Enumeration playbook matcher
+│   ├── providers.py               # AI provider abstraction (Ollama) + stage routing
+│   ├── reporting.py               # HTML + text report generation
+│   ├── role_detection.py          # Host role classification
+│   ├── state.py                   # Persistent iterative case state
+│   ├── agents/                    # Explicit multi-agent stage wrappers
+│   ├── core/                      # Canonical policy, scope guard, router, schemas, executor helpers
+│   ├── knowledge/                 # Markdown playbooks, methodology notes, report language templates
+│   ├── rag/                       # ChromaDB + Ollama embedding ingestion and retrieval
+│   └── prompts/                   # Structured prompt templates for iterative workflow
 ├── data/
-│   └── enumeration_playbooks.json # 120+ service playbooks
+│   ├── enumeration_playbooks.json # Structured service playbooks used by matching + RAG
+│   └── cve_database.db            # Local CVE SQLite database (created after update)
 ├── logs/                          # Auto-created; run_<timestamp>.log per run
 ├── reports/                       # Auto-created; one subfolder per run
 ├── tests/
 │   ├── test_assistant.py
 │   ├── test_command_sanity_check.py
-│   ├── test_cve_updater.py
-│   ├── test_dashboard.py
 │   ├── test_iterative_workflow.py
-│   ├── test_model_routing.py
-│   └── test_reporting.py
+│   ├── test_phase2c_safety_hardening.py
+│   ├── test_rag_*.py
+│   ├── test_web_discovery_policy.py
+│   └── ...
 └── update_cve_db.py               # NVD feed downloader + importer
 ```
 
